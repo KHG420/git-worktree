@@ -80,6 +80,14 @@ t('405: mutations require POST, reads require GET', async () => {
   assert.equal((await req(base, 'DELETE', '/dsh-git-worktree/list')).status, 405)
 })
 
+t('405: HEAD and OPTIONS are refused on every action', async () => {
+  assert.equal((await req(base, 'HEAD', '/dsh-git-worktree/status')).status, 405)
+  assert.equal((await req(base, 'HEAD', '/dsh-git-worktree/list')).status, 405)
+  assert.equal((await req(base, 'OPTIONS', '/dsh-git-worktree/status')).status, 405)
+  assert.equal((await req(base, 'OPTIONS', '/dsh-git-worktree/add')).status, 405)
+  assert.equal((await req(base, 'PATCH', '/dsh-git-worktree/branches')).status, 405)
+})
+
 // ── 404s ────────────────────────────────────────────────────────────────────
 
 t('404: unknown action and empty action', async () => {
@@ -135,6 +143,33 @@ t('status: missing repo param falls back to the server cwd (a real repo)', async
   assert.equal(r.json.data.branch, 'main')
 })
 
+t('status: empty repo param (?repo=) behaves like a missing param, not a 400', async () => {
+  // resolvePathArg('') -> undefined -> the command cwd falls back to the
+  // server process cwd, exactly like the absent param
+  const r = await req(base, 'GET', '/dsh-git-worktree/status?repo=')
+  assert.equal(r.status, 200)
+  assert.equal(r.json.ok, true)
+  assert.ok(!r.json.data.notARepo, 'empty repo param does not fail')
+  assert.equal(r.json.data.branch, 'main')
+})
+
+t('status: repo param with a literal + is decoded as space (standard form-encoding)', async () => {
+  // per application/x-www-form-urlencoded a raw '+' means space; clients must
+  // percent-encode a real '+' as %2B — verify both sides of the contract
+  const withPlus = join(root, 'repo+plus')
+  mkdirSync(withPlus, { recursive: true })
+  const { execFileSync } = await import('node:child_process')
+  execFileSync('git', ['-C', withPlus, 'init', '-q', '-b', 'main'], { stdio: 'ignore' })
+  execFileSync('git', ['-C', withPlus, 'config', 'user.email', 't@t'], { stdio: 'ignore' })
+  execFileSync('git', ['-C', withPlus, 'config', 'user.name', 'T'], { stdio: 'ignore' })
+  const encoded = await req(base, 'GET', `/dsh-git-worktree/status?repo=${encodeURIComponent(withPlus)}`)
+  assert.equal(encoded.status, 200, 'encodeURIComponent round-trips a real +')
+  assert.ok(!encoded.json.data.notARepo)
+  const rawPlus = await req(base, 'GET', `/dsh-git-worktree/status?repo=${withPlus}`)
+  assert.equal(rawPlus.status, 200)
+  assert.equal(rawPlus.json.data.notARepo, true, 'a raw + decodes to a space — clients must percent-encode it')
+})
+
 t('status: repo param with URL-encoded special characters (space, #)', async () => {
   const withSpace = join(root, 'repo with space')
   mkdirSync(withSpace, { recursive: true })
@@ -173,6 +208,17 @@ t('add: git failures surface 400 with the exit code', async () => {
   assert.equal(r.status, 400)
   assert.equal(r.json.ok, false)
   assert.match(r.json.error.message, /not a git repository/)
+  assert.equal(typeof r.json.error.exitCode, 'number')
+})
+
+t('add: a nonexistent commitIsh fails with 400 over HTTP', async () => {
+  const r = await req(base, 'POST', '/dsh-git-worktree/add', {
+    repo, name: 'badish-http', newBranch: 'badish-http-b',
+    commitIsh: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+  })
+  assert.equal(r.status, 400)
+  assert.equal(r.json.ok, false)
+  assert.match(r.json.error.message, /invalid reference|unknown revision|not a valid/i)
   assert.equal(typeof r.json.error.exitCode, 'number')
 })
 

@@ -12,7 +12,7 @@
 import assert from 'node:assert/strict'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { bootPlugin, execAt, git, makeRepo, scratchRoot } from './helpers.js'
+import { bootPlugin, execAt, git, makeRepo, makeUnbornRepo, scratchRoot } from './helpers.js'
 import { canonicalize } from '../lib/git.js'
 
 let passed = 0
@@ -224,6 +224,55 @@ t('flow: two bound conversations coexist without crossing; git refuses double-ch
   await plugin.tools.git_worktree_remove.execute({ path: wtB }, exec)
   const final = await plugin.tools.git_worktree_list.execute({}, exec)
   assert.equal(final.worktrees.length, 1, 'only the primary remains')
+})
+
+// ── FLOW 6: one-click bound conversation on an UNBORN repo ──────────────────
+t('flow: fresh (unborn) repo — one click creates the first bound conversation', async () => {
+  const plugin = await bootPlugin()
+  const panel = makePanel(plugin)
+  const fresh = makeUnbornRepo(root, 'fresh')
+
+  // the developer's first bound conversation on a brand-new repo
+  const created = await panel.route('add', { repo: fresh, name: 'kickoff', unique: true })
+  assert.equal(created.status, 200)
+  assert.equal(created.payload.data.branch, 'kickoff')
+  const wt = created.payload.data.absolutePath
+
+  const opened = await panel.openBoundSession(wt)
+  assert.equal(opened.ok, true)
+  const binding = await plugin.tools.git_session_binding.execute({}, execAt(wt))
+  assert.equal(binding.bound, true, 'conversation bound on the unborn repo')
+  assert.equal(binding.worktree.branch, 'kickoff')
+  assert.equal(binding.notARepo, false)
+
+  await panel.route('remove', { repo: fresh, path: wt })
+})
+
+// ── FLOW 7: two panels race to create the same feature name ─────────────────
+t('flow: simultaneous one-click creates for the same name never collide', async () => {
+  const plugin = await bootPlugin()
+  const panel = makePanel(plugin)
+
+  const [a, b] = await Promise.all([
+    panel.route('add', { repo, name: 'double-click', unique: true }),
+    panel.route('add', { repo, name: 'double-click', unique: true }),
+  ])
+  assert.equal(a.status, 200)
+  assert.equal(b.status, 200)
+  const paths = [a.payload.data.absolutePath, b.payload.data.absolutePath].sort()
+  assert.notEqual(paths[0], paths[1], 'two distinct worktrees created')
+  assert.ok(paths[0].endsWith('double-click') && paths[1].endsWith('double-click-2'), 'base name and deduped sibling')
+
+  // both open bound sessions on their own worktrees
+  const opened = await Promise.all([panel.openBoundSession(paths[0]), panel.openBoundSession(paths[1])])
+  assert.ok(opened.every((o) => o.ok === true))
+  const bindA = await plugin.tools.git_session_binding.execute({}, execAt(paths[0]))
+  const bindB = await plugin.tools.git_session_binding.execute({}, execAt(paths[1]))
+  assert.equal(bindA.bound, true)
+  assert.equal(bindB.bound, true)
+
+  await panel.route('remove', { repo, path: paths[0] })
+  await panel.route('remove', { repo, path: paths[1] })
 })
 
 // ── sequential runner ───────────────────────────────────────────────────────

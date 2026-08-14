@@ -254,6 +254,20 @@ t('add: unique dedupes when the auto branch is checked out elsewhere', async () 
   await tools.git_worktree_remove.execute({ path: join(repo, '.dsh-wt', 'taken-2') }, exec)
 })
 
+t('add: unique dedupes a registered-but-missing worktree ("already registered")', async () => {
+  // delete ONLY the worktree directory, keeping its git registration — git
+  // answers "missing but already registered worktree"; unique must retry to
+  // a suffixed name instead of surfacing the raw git failure (regression for
+  // the one-click panel flow after a manually-deleted worktree dir)
+  await tools.git_worktree_add.execute({ name: 'ghosted', newBranch: 'ghosted-b' }, exec)
+  const { rmSync } = await import('node:fs')
+  rmSync(join(repo, '.dsh-wt', 'ghosted'), { recursive: true, force: true })
+  const r = await tools.git_worktree_add.execute({ name: 'ghosted', unique: true }, exec)
+  assert.equal(r.branch, 'ghosted-2', 'registered-but-missing path dedupes to -2')
+  await tools.git_worktree_remove.execute({ path: join(repo, '.dsh-wt', 'ghosted-2') }, exec)
+  git(repo, 'worktree', 'prune') // drop the stale registration
+})
+
 // ── git_worktree_remove ─────────────────────────────────────────────────────
 
 t('remove: dirty worktree refuses without force, removes with force', async () => {
@@ -400,6 +414,146 @@ t('add from inside a linked worktree never nests under the caller', async () => 
   assert.equal(r.absolutePath, canonicalize(join(repo, '.dsh-wt', 'inner')), 'anchored to the main repo root')
   await tools.git_worktree_remove.execute({ path: join(repo, '.dsh-wt', 'inner') }, execAt(wt))
   await tools.git_worktree_remove.execute({ path: wt }, exec)
+})
+
+// ── review findings: binding attach, unborn flows, races, dirty matrix ──────
+
+t('status: bound session in an outside-path worktree carries the binding block', async () => {
+  // a worktree created at an explicit path OUTSIDE the main repo root — its
+  // --show-toplevel is the worktree root, not the main root, so the binding
+  // attach must compare main roots, not the worktree root
+  const outside = join(root, 'wt-outside')
+  await tools.git_worktree_add.execute({ path: outside, newBranch: 'outside-b' }, exec)
+  const st = await tools.git_repo_status.execute({}, execAt(outside))
+  assert.equal(st.binding.bound, true, 'binding attached for a bound outside worktree')
+  assert.equal(st.binding.worktree.absolutePath, canonicalize(outside))
+  assert.equal(st.binding.worktree.primary, false)
+  // and via a subdirectory of that worktree
+  const sub = join(outside, 'deep')
+  mkdirSync(sub, { recursive: true })
+  const st2 = await tools.git_repo_status.execute({}, execAt(sub))
+  assert.equal(st2.binding.bound, true)
+  await tools.git_worktree_remove.execute({ path: outside }, exec)
+})
+
+t('status: a nested repo inside the session repo does not inherit the session binding', async () => {
+  const nested = join(repo, 'nested-repo')
+  mkdirSync(nested, { recursive: true })
+  git(nested, 'init', '-q', '-b', 'main')
+  git(nested, 'config', 'user.email', 't@t')
+  git(nested, 'config', 'user.name', 'T')
+  commitFile(nested, 'n.txt', 'n\n', 'init')
+  // querying the nested repo from the session repo: it is a DIFFERENT repo
+  const r1 = await tools.git_repo_status.execute({ repo: nested }, exec)
+  assert.equal(r1.binding, undefined, 'nested repo is foreign — no session binding attached')
+  // from INSIDE the nested repo the binding is its own primary
+  const r2 = await tools.git_repo_status.execute({}, execAt(nested))
+  assert.equal(r2.binding.bound, false)
+  assert.equal(r2.binding.worktree.primary, true)
+  // remove the nested repo so the outer repo stays clean (a nested .git dir
+  // shows as untracked and `git clean` refuses to remove it)
+  const { rmSync } = await import('node:fs')
+  rmSync(nested, { recursive: true, force: true })
+})
+
+t('unborn repo: worktree add (name+newBranch and name-only) creates the first bound worktree', async () => {
+  const r = await tools.git_worktree_add.execute({ name: 'first', newBranch: 'first' }, execUnborn)
+  assert.equal(r.path, '.dsh-wt/first')
+  assert.equal(r.branch, 'first')
+  const binding = await tools.git_session_binding.execute({}, execAt(join(unborn, '.dsh-wt', 'first')))
+  assert.equal(binding.bound, true, 'unborn-repo worktree is a real binding')
+  await tools.git_worktree_remove.execute({ path: join(unborn, '.dsh-wt', 'first') }, execUnborn)
+  const r2 = await tools.git_worktree_add.execute({ name: 'only' }, execUnborn)
+  assert.equal(r2.branch, 'only', 'name-only add derives the branch from the path component')
+  await tools.git_worktree_remove.execute({ path: join(unborn, '.dsh-wt', 'only') }, execUnborn)
+})
+
+t('unborn repo: branch_create surfaces git\'s start-point error; switch -c works', async () => {
+  // `git branch <name>` on an unborn HEAD has no start point — git's own
+  // failure surfaces as designed (the plugin does not invent a start point)
+  await rejects(tools.git_branch_create.execute({ name: 'b1' }, execUnborn),
+    /not a valid object name|valid branch name/, 'unborn branch_create surfaces git\'s error')
+  // switch -c from an unborn HEAD works and MIGRATES the unborn branch —
+  // git semantics: the old unborn ref is gone, HEAD now points at b2
+  const sw = await tools.git_branch_switch.execute({ name: 'b2', create: true }, execUnborn)
+  assert.equal(sw.created, true)
+  assert.equal((await tools.git_repo_status.execute({}, execUnborn)).branch, 'b2')
+  await rejects(tools.git_branch_switch.execute({ name: 'main' }, execUnborn),
+    /invalid reference|not find/, 'the migrated-away unborn branch no longer exists')
+})
+
+t('unborn repo: repo_status reports untracked files as dirty', async () => {
+  writeFileSync(join(unborn, 'u.txt'), 'x\n')
+  const r = await tools.git_repo_status.execute({}, execUnborn)
+  assert.equal(r.clean, false)
+  assert.ok(r.entries.some((e) => e.path === 'u.txt' && e.x === '?' && e.y === '?'), 'untracked entry in an unborn repo')
+  const { rmSync } = await import('node:fs')
+  rmSync(join(unborn, 'u.txt'), { force: true })
+})
+
+t('parallel unique adds with the same name never collide', async () => {
+  // two panels / agents clicking "create" for the same feature at once: git
+  // serializes the actual creation, the loser's "already exists" triggers the
+  // unique retry to -2
+  const [a, b] = await Promise.all([
+    tools.git_worktree_add.execute({ name: 'race', unique: true }, exec),
+    tools.git_worktree_add.execute({ name: 'race', unique: true }, exec),
+  ])
+  const paths = [a.path, b.path].sort()
+  assert.deepEqual(paths, ['.dsh-wt/race', '.dsh-wt/race-2'], 'one wins the base name, the other retries to -2')
+  assert.equal(a.branch !== b.branch, true, 'distinct branches')
+  await tools.git_worktree_remove.execute({ path: join(repo, '.dsh-wt', 'race') }, exec)
+  await tools.git_worktree_remove.execute({ path: join(repo, '.dsh-wt', 'race-2') }, exec)
+})
+
+t('status: dirty matrix — staged, unstaged, untracked, renamed, deleted', async () => {
+  // committed baseline
+  writeFileSync(join(repo, 'staged.txt'), 's\n')
+  writeFileSync(join(repo, 'unstaged.txt'), 'u1\n')
+  writeFileSync(join(repo, 'rename-src.txt'), 'r\n')
+  writeFileSync(join(repo, 'deleted.txt'), 'd\n')
+  git(repo, 'add', 'staged.txt', 'unstaged.txt', 'rename-src.txt', 'deleted.txt')
+  git(repo, 'commit', '-q', '-m', 'dirty setup')
+  // five independent dirty states
+  writeFileSync(join(repo, 'staged.txt'), 's2\n')
+  git(repo, 'add', 'staged.txt')                        // staged modification  -> "M  staged.txt"
+  writeFileSync(join(repo, 'unstaged.txt'), 'u2\n')     // unstaged modification -> " M unstaged.txt"
+  writeFileSync(join(repo, 'untracked.txt'), 'x\n')     // untracked             -> "?? untracked.txt"
+  git(repo, 'mv', 'rename-src.txt', 'renamed.txt')      // staged rename         -> "R  rename-src.txt -> renamed.txt"
+  const { rmSync } = await import('node:fs')
+  rmSync(join(repo, 'deleted.txt'), { force: true })    // unstaged deletion     -> " D deleted.txt"
+  const r = await tools.git_repo_status.execute({}, exec)
+  assert.equal(r.clean, false)
+  assert.ok(r.entries.some((e) => e.x === 'M' && e.y === ' ' && e.path === 'staged.txt'), 'staged modification')
+  assert.ok(r.entries.some((e) => e.x === ' ' && e.y === 'M' && e.path === 'unstaged.txt'), 'unstaged modification')
+  assert.ok(r.entries.some((e) => e.x === '?' && e.y === '?' && e.path === 'untracked.txt'), 'untracked')
+  assert.ok(r.entries.some((e) => e.x === 'R' && e.path === 'rename-src.txt -> renamed.txt'), 'renamed')
+  assert.ok(r.entries.some((e) => e.x === ' ' && e.y === 'D' && e.path === 'deleted.txt'), 'deleted')
+  // restore a clean tree (git clean needs -d: empty untracked dirs like
+  // the .dsh-wt/ parent left by earlier worktree removals are directories)
+  git(repo, 'reset', '-q', '--hard', 'HEAD')
+  git(repo, 'clean', '-f', '-d', '-q')
+  assert.equal((await tools.git_repo_status.execute({}, exec)).clean, true, 'cleanup restored a clean tree')
+})
+
+t('add: a nonexistent commitIsh surfaces git\'s failure (branch left behind is git\'s artifact)', async () => {
+  await rejects(
+    tools.git_worktree_add.execute({ name: 'badish', newBranch: 'badish-b', commitIsh: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' }, exec),
+    /invalid reference|unknown revision|not a valid/i,
+    'nonexistent commitIsh is refused',
+  )
+})
+
+t('add: name and path together — path wins (documented precedence)', async () => {
+  const explicit = join(root, 'both-given')
+  const r = await tools.git_worktree_add.execute({ name: 'ignored', path: explicit, newBranch: 'both-b' }, exec)
+  // the returned absolutePath is the caller's own path form (absolute args
+  // pass through untouched); the worktree itself lives at the canonical form
+  assert.equal(r.absolutePath, explicit, 'explicit path takes precedence over name')
+  const list = await tools.git_worktree_list.execute({}, exec)
+  assert.ok(list.worktrees.some((w) => w.absolutePath === canonicalize(explicit)), 'worktree created at the explicit path')
+  assert.ok(!list.worktrees.some((w) => w.path.includes('ignored')), 'no worktree created for the ignored name')
+  await tools.git_worktree_remove.execute({ path: explicit }, exec)
 })
 
 // ── sequential runner (these tests share one repo — order matters) ─────────

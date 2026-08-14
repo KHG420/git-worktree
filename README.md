@@ -154,14 +154,22 @@ dsh-git-worktree/
 
 ```sh
 node test/run-all.js     # 全部套件一次跑完（任一失败即非零退出）/ every suite, non-zero exit on failure
-node test/unit-parse.js  # 纯解析器：worktree/branch/status 输出（含 unborn、detached、prunable、ahead/behind）
+node test/unit-parse.js  # 纯解析器：worktree/branch/status 输出（含 unborn、detached、prunable、ahead/behind、[gone]）
 node test/unit-git.js    # git 运行器与路径助手：exit codes、abort、信号杀死、字节上限、cwd 分类
 node test/test.js        # 原功能测试：9 工具 + 路由处理器（bindings、unique 去重、绑定解析）
-node test/tools-edge.js  # 9 工具边界矩阵：遍历防护、detach/commitIsh/force、脏工作树、上游/远程
-node test/routes-http.js # 真实 HTTP：方法校验、坏 JSON/超大 body、严格 vs 宽容 notARepo、超时 abort
-node test/client-unit.js # 客户端纯函数：sanitizeName 边界、sessionsSame、api() 错误映射
-node test/client-dom.js  # jsdom 面板交互：创建/打开绑定会话、删除+归档、点击外部关闭、刷新合并
-node test/flows.js       # 真实用户操作流：一键绑定会话、agent 准备/开发者打开、全生命周期、跨仓库
+node test/tools-edge.js  # 9 工具边界矩阵：遍历防护、detach/commitIsh/force、脏工作树、上游/远程、unborn 仓库、
+                         # 外部路径工作树绑定、嵌套仓库、并发 unique 竞态、already-registered 去重、脏状态矩阵
+node test/routes-http.js # 真实 HTTP：方法校验（含 HEAD/OPTIONS）、坏 JSON/超大 body、空 repo 参数、+ 号编码、
+                         # 严格 vs 宽容 notARepo、超时 abort
+node test/client-unit.js # 客户端纯函数：sanitizeName 边界（切片尾点、HEAD、代理对、check-ref-format 性质测试）、
+                         # sessionsSame、api() 错误映射
+node test/client-dom.js  # jsdom 面板交互：创建/打开绑定会话、删除+归档、点击外部关闭、刷新合并、
+                         # 失败渲染、busy 禁用、repo 切换、会话打开失败提示
+node test/flows.js       # 真实用户操作流：一键绑定会话、agent 准备/开发者打开、全生命周期、跨仓库、
+                         # unborn 仓库首绑、双面板同名竞态
+node test/schema-conformance.js # 工具输出 vs 声明 schema（harness 的 validateJsonSchemaValue 原样复放）：
+                         # 9 工具全部输出必须通过 additionalProperties:false 校验——防止
+                         # 遗漏 absolutePath / 可空 branch 之类的 schema 漂移在真实会话里炸掉
 ```
 
 `client-dom.js` 需要 jsdom（插件本身不依赖它）：从 DeepSeek Harness checkout 解析（`DSH_HARNESS` 指向其根目录，默认 `/Users/aq/deepseek-harness`），找不到时该套件自动跳过。`KEEP_SCRATCH=1` 可保留测试用临时仓库以便检查。

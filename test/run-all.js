@@ -18,6 +18,7 @@ const suites = [
   'client-unit.js',   // client pure helpers (sanitizeName, sessionsSame, api)
   'client-dom.js',    // jsdom panel interaction tests
   'flows.js',         // real-user-operation flows (panel + agent sequences)
+  'schema-conformance.js', // tool outputs vs declared schemas (harness validator)
 ]
 
 let failed = 0

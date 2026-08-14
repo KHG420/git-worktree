@@ -155,6 +155,14 @@ t('status: ahead only / behind only', () => {
   assert.equal(parseStatus('## main...origin/main [behind 4]\n').ahead, 0)
 })
 
+t('status: [gone] upstream (deleted remote branch) parses the branch with zero sync', () => {
+  const s = parseStatus('## main...origin/main [gone]\n')
+  assert.equal(s.branch, 'main')
+  assert.equal(s.ahead, 0)
+  assert.equal(s.behind, 0)
+  assert.deepEqual(s.entries, [])
+})
+
 t('status: dirty entry kinds (modified, untracked, staged, renamed)', () => {
   const s = parseStatus([
     '## main',

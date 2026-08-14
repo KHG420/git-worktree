@@ -7,6 +7,7 @@
  * Run: node test/client-unit.js
  */
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { pathToFileURL } from 'node:url'
 import { createRequire } from 'node:module'
 import React from 'react'
@@ -98,6 +99,56 @@ t('sanitizeName: 80-char cap and never-empty results', () => {
     assert.ok(!/[\s~^:?*[\]\\@]/.test(out), `no forbidden char in ${JSON.stringify(out)}`)
     assert.ok(!out.includes('..') && !out.includes('//') && !out.includes('@{'), `no forbidden sequence in ${out}`)
     assert.ok(!out.endsWith('.'), `no trailing dot in ${out}`)
+  }
+})
+
+t('sanitizeName: the 80-char slice never re-exposes a trailing dot', () => {
+  // 79 chars + ".b": the pre-slice name has no trailing dot (ends in "b"),
+  // so the strip does not fire before slicing — the 80-char cut then lands
+  // on the dot. The post-slice strip must remove it again.
+  const out = sanitizeName('a'.repeat(79) + '.b')
+  assert.equal(out.length, 79, 'trailing dot stripped after the slice')
+  assert.ok(!out.endsWith('.'))
+  assert.equal(sanitizeName('a'.repeat(79) + '-.'), 'a'.repeat(79))
+  assert.equal(sanitizeName('a'.repeat(79) + '.lock'), 'a'.repeat(79), '.lock dropped before the slice')
+})
+
+t('sanitizeName: the reserved branch name HEAD falls back to wt', () => {
+  assert.equal(sanitizeName('HEAD'), 'wt')
+  assert.equal(sanitizeName('HEAD '), 'wt')
+  assert.equal(sanitizeName('head'), 'head', 'lowercase head is a legal ref')
+  assert.equal(sanitizeName('HEAD~1'), 'HEAD-1', 'only the exact reserved name is guarded')
+  assert.equal(sanitizeName('HEAD/feature'), 'HEAD-feature')
+})
+
+t('sanitizeName: slicing by code points never splits a surrogate pair', () => {
+  // 'a' + 40 emoji is 81 UTF-16 units; a unit-based slice(0,80) would cut a
+  // lone surrogate. Code-point slicing keeps the whole emoji.
+  const out = sanitizeName('a' + '😀'.repeat(40))
+  for (const ch of out) {
+    const code = ch.codePointAt(0)
+    assert.ok(code < 0xd800 || code > 0xdfff, `no lone surrogate (U+${code.toString(16)})`)
+  }
+  assert.ok(out.endsWith('😀'), 'last emoji intact')
+  assert.ok(Array.from(out).length <= 80, 'at most 80 code points')
+})
+
+t('sanitizeName: every output passes git check-ref-format (property matrix)', () => {
+  const inputs = [
+    'a b', 'a..b', 'a//b', 'a@{b', 'a@b', 'a.', '.a', '~^:?*[\\@', '控 制/字\\符',
+    'foo.lock', 'my.LOCK', '.lock', 'HEAD', 'head', 'HEAD~1',
+    'a'.repeat(79) + '.b', 'a'.repeat(200), '😀'.repeat(41), 'a' + '😀'.repeat(40),
+    'x.\n', '...', '///', '-leading', 'trailing-', '  Hello World!!  ',
+    '@leading', 'a---b', '..dots..', 'a.b.c', 'feature/x', 'wt', 'a-b-c',
+  ]
+  for (const input of inputs) {
+    const out = sanitizeName(input)
+    assert.ok(Array.from(out).length >= 1 && Array.from(out).length <= 80, `code-point length in [1,80] for ${JSON.stringify(out)}`)
+    try {
+      execFileSync('git', ['check-ref-format', `refs/heads/${out}`], { stdio: 'pipe' })
+    } catch (error) {
+      throw new Error(`sanitizeName(${JSON.stringify(input)}) -> ${JSON.stringify(out)} is NOT a valid git ref: ${error.stderr}`)
+    }
   }
 })
 

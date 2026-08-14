@@ -103,21 +103,28 @@ window.__ModuleLoader__.load({
 
     /**
      * Sanitize a user-entered feature name into a git-ref-safe worktree/branch
-     * name: drop only what `git check-ref-format` forbids (control chars,
-     * space, ~ ^ : ? * [ \ @{ .. //, a trailing .lock) plus path separators,
-     * collapse runs of '-' and trim leading/trailing separators. Non-ASCII
-     * names (e.g. Chinese) are legal git refs and are preserved.
+     * name: conservatively drop what `git check-ref-format` forbids (control
+     * chars, space, ~ ^ : ? * [ \ .. //, a trailing .lock) plus path
+     * separators and the '@' of a forbidden '@{' sequence, collapse runs of
+     * '-' and trim leading/trailing separators. Non-ASCII names (e.g. Chinese)
+     * are legal git refs and are preserved. The final result is guaranteed to
+     * pass `git check-ref-format refs/heads/<name>`.
      */
     const sanitizeName = (raw) => {
       const s = raw.trim()
         .replace(/[\u0000-\u001f\u007f ~^:?*[\]\\/@]+/g, "-")
-        .replace(/@{/g, "-")
         .replace(/\.\./g, "-")
         .replace(/-+/g, "-")
         .replace(/^[-.]+|[-.]+$/g, "")
-        .replace(/\.lock$/i, "")
-        .slice(0, 80);
-      return s === "" || s === "." || s === ".." ? "wt" : s;
+        .replace(/\.lock$/i, "");
+      // Slice by code points, not UTF-16 units: an 80-unit cut can split a
+      // surrogate pair ('a' + 40 emoji is 81 units -> lone surrogate).
+      const cut = Array.from(s).slice(0, 80).join("");
+      // The slice can re-expose a trailing dot (a 79-char prefix ending in
+      // '.'), which git forbids — strip it again, then guard the reserved
+      // 'HEAD' branch name and the degenerate results.
+      const out = cut.replace(/[-.]+$/g, "");
+      return out === "" || out === "." || out === ".." || out === "HEAD" ? "wt" : out;
     };
 
     /**
@@ -298,8 +305,10 @@ window.__ModuleLoader__.load({
             ...result,
             opened: opened === null ? null : opened.ok ? true : false,
           });
-          if (opened !== null && !opened.ok) setError(opened.message ?? "session could not be opened");
           await refresh(target);
+          // refresh() clears the error line at its start, so surface the
+          // open-failure reason AFTER it — otherwise the reason is lost
+          if (opened !== null && !opened.ok) setError(opened.message ?? "session could not be opened");
           setName("");
         } catch (e) {
           setError(e instanceof Error ? e.message : String(e));
@@ -333,8 +342,9 @@ window.__ModuleLoader__.load({
         setError(null);
         try {
           const result = await openBoundSession(wt.absolutePath ?? wt.path);
-          if (!result.ok) setError(result.message ?? "could not open a bound conversation");
           await refresh();
+          // refresh() clears the error line at its start — set the reason after
+          if (!result.ok) setError(result.message ?? "could not open a bound conversation");
         } catch (e) {
           setError(e instanceof Error ? e.message : String(e));
         } finally {

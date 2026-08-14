@@ -376,6 +376,94 @@ t('panel: not-a-repo input shows the hint', async () => {
   await m.unmount()
 })
 
+t('panel: fetch failure renders the error and clears the worktree list', async () => {
+  const fetch = async (url) => {
+    if (String(url).includes('/list?')) throw new Error('network down')
+    return { ok: true, status: 200, json: async () => ({ ok: true, data: {} }) }
+  }
+  const m = mount({ fetch })
+  await m.render()
+  await m.act(async () => { $('.gwt-badge').click() })
+  await m.act(async () => {})
+  await m.act(async () => {})
+  assert.ok(text('.gwt-error').includes('network down'), 'error message rendered')
+  assert.ok(text('.gwt-rows').includes('暂无'), 'empty-list note shown after the failure')
+  assert.ok(!text('.gwt-status').includes('branch main'), 'stale status cleared')
+  await m.unmount()
+})
+
+t('panel: busy state disables the create/open buttons while a refresh is in flight', async () => {
+  let release
+  const gate = new Promise((r) => { release = r })
+  let listCount = 0
+  const fetch = async (url) => {
+    const u = String(url)
+    let body
+    if (u.includes('/list?')) {
+      listCount += 1
+      if (listCount > 1) await gate // gate only the second (manual) refresh
+      body = { ok: true, data: { worktrees: WORKTREES, notARepo: false } }
+    } else if (u.includes('/status?')) body = { ok: true, data: { ...STATUS, notARepo: false } }
+    else if (u.includes('/bindings')) body = { ok: true, data: { bindings: BINDINGS } }
+    else body = { ok: true, data: {} }
+    return { ok: true, status: 200, json: async () => body }
+  }
+  const m = mount({ fetch })
+  await m.render()
+  await m.act(async () => { $('.gwt-badge').click() })
+  await m.act(async () => {})
+  await m.act(async () => {})
+  await m.act(async () => { type($('.gwt-createInput'), 'busy-name') })
+  await m.act(async () => {})
+  assert.ok(!$('.gwt-btnPrimary').disabled, 'create enabled once a name is typed')
+  // manual refresh is now gated → busy stays true until released
+  await m.act(async () => { $('.gwt-btn').click() }) // 刷新
+  await new Promise((r) => setTimeout(r, 30))
+  await m.act(async () => {})
+  assert.ok($('.gwt-btnPrimary').disabled, 'create-bound disabled while busy')
+  assert.ok([...document.querySelectorAll('button')].find((b) => b.textContent.includes('仅创建工作树')).disabled, 'worktree-only disabled while busy')
+  assert.ok(text('.gwt-btn').includes('…'), 'refresh shows the busy ellipsis')
+  release()
+  await m.act(async () => {})
+  await m.act(async () => {})
+  assert.ok(!$('.gwt-btnPrimary').disabled, 'buttons re-enabled after the refresh settles')
+  await m.unmount()
+})
+
+t('panel: switching the repo input and refreshing targets the new repo', async () => {
+  const calls = []
+  const m = mount({ fetch: makeFetch({ calls }) })
+  await m.render()
+  await m.act(async () => { $('.gwt-badge').click() })
+  await m.act(async () => {})
+  await m.act(async () => {})
+  await m.act(async () => { type($('.gwt-repo'), '/other/repo') })
+  await m.act(async () => { $('.gwt-btn').click() }) // 刷新
+  await m.act(async () => {})
+  await m.act(async () => {})
+  const listCalls = calls.filter((c) => c.url.includes('/list?'))
+  assert.ok(listCalls.length >= 2, 'a second refresh fired')
+  assert.ok(listCalls.at(-1).url.includes(encodeURIComponent('/other/repo')), 'refresh targets the new repo')
+  await m.unmount()
+})
+
+t('panel: created notice reports a failed session open (opened:false)', async () => {
+  const m = mount({
+    openBoundSession: async () => ({ ok: false, message: 'workspace full' }),
+  })
+  await m.render()
+  await m.act(async () => { $('.gwt-badge').click() })
+  await m.act(async () => {})
+  await m.act(async () => {})
+  await m.act(async () => { type($('.gwt-createInput'), 'fail-open') })
+  await m.act(async () => { $('.gwt-btnPrimary').click() })
+  await m.act(async () => {})
+  await m.act(async () => {})
+  assert.ok(text('.gwt-created').includes('会话打开失败'), 'failure notice rendered in the created box')
+  assert.ok(text('.gwt-error').includes('workspace full'), 'failure reason shown in the error line')
+  await m.unmount()
+})
+
 t('panel: create button disabled for empty name or repo', async () => {
   const m = mount()
   await m.render()
