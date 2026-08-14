@@ -1,0 +1,11 @@
+# dsh-git-worktree bundle patch: registers the git branch/worktree tool suite
+# and the panel REST routes as ONE plugin row in the profile composition.
+#
+# The row registers on the HOST plane, so the tools land in the registry's
+# global layer and are visible to every agent (agent -> preset -> global);
+# the webServer routes are host-plane by nature.
+
+- insert:
+    - id: git-worktree
+      name: 'dsh-git-worktree'
+      config: {}
