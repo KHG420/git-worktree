@@ -379,41 +379,21 @@ window.__ModuleLoader__.load({
         }
       };
 
-      /**
-       * Badge click: open the host's native OS folder chooser first, so the
-       * operator can pick the working directory (the repo path the panel
-       * operates on) instead of typing it. A picked path becomes `repo` —
-       * opening the panel on it (closed) or refreshing in place (open).
-       * Cancelling — or a host without the `native` picker capability —
-       * falls back to the plain open/close toggle, so peeking at the panel
-       * still works.
-       */
-      const onBadgeClick = async () => {
+      /** Open the host's OS folder chooser and point the repo input at the picked directory. */
+      const onPickRepo = async () => {
         if (busy) return;
         setBusy(true);
         setError(null);
-        let picked = null;
-        let failed = null;
         try {
-          picked = await pickDirectory();
+          const picked = await pickDirectory();
+          if (picked !== null && picked !== "") {
+            setRepo(picked);
+            await refresh(picked);
+          }
         } catch (e) {
-          failed = e instanceof Error ? e.message : String(e);
+          setError(e instanceof Error ? e.message : String(e));
         } finally {
           setBusy(false);
-        }
-        if (picked !== null && picked !== "") {
-          setRepo(picked);
-          if (open) {
-            await refresh(picked);
-          } else {
-            setOpen(true); // the refresh effect fires on open and targets the new repo
-          }
-        } else {
-          setOpen((value) => !value);
-          // refresh() clears the error line at its start, so on the open
-          // path this message is transient — it stays visible when the
-          // panel is already open (no re-refresh happens there).
-          if (failed !== null) setError(failed);
         }
       };
 
@@ -422,8 +402,8 @@ window.__ModuleLoader__.load({
         className: cx("gwt-badge"),
         "aria-label": "Git worktrees",
         "aria-expanded": open,
-        title: "Git worktrees — 选择工作目录 / pick working directory",
-        onClick: () => void onBadgeClick(),
+        title: "Git worktrees",
+        onClick: () => setOpen((value) => !value),
         children: [
           react_jsx_runtime.jsx("span", { children: "⑂" }),
           wide && react_jsx_runtime.jsx("span", { children: "Bindings" }),
@@ -450,6 +430,16 @@ window.__ModuleLoader__.load({
               react_jsx_runtime.jsx("button", {
                 type: "button",
                 className: "gwt-btn",
+                "data-action": "pick",
+                disabled: busy,
+                title: "选择文件夹 / pick a folder",
+                onClick: () => void onPickRepo(),
+                children: busy ? "…" : "选择目录",
+              }),
+              react_jsx_runtime.jsx("button", {
+                type: "button",
+                className: "gwt-btn",
+                "data-action": "refresh",
                 disabled: busy,
                 onClick: () => refresh(),
                 children: busy ? "…" : "刷新",

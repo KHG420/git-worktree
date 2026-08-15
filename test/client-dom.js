@@ -202,55 +202,54 @@ t('panel: opens on badge click, refreshes once, renders worktrees + bindings', a
   await m.unmount()
 })
 
-t('panel: badge click picks a folder → repo input set, panel opens on it', async () => {
+t('panel: pick button selects a folder → repo input updated and refresh targets it', async () => {
   const calls = []
   const m = mount({ fetch: makeFetch({ calls }), pickDirectory: async () => '/picked/repo' })
   await m.render()
+  // the badge still just toggles the panel — the picker lives next to the input
   await m.act(async () => { $('.gwt-badge').click() })
   await m.act(async () => {})
   await m.act(async () => {})
-  assert.ok($('.gwt-panel'), 'panel opens after picking a folder')
+  assert.ok($('.gwt-panel'), 'panel opens on badge click')
+  const pickBtn = $('[data-action="pick"]')
+  assert.ok(pickBtn, 'folder-pick button rendered after the repo input')
+  await m.act(async () => { pickBtn.click() })
+  await m.act(async () => {})
+  await m.act(async () => {})
   assert.equal($('.gwt-repo').value, '/picked/repo', 'repo input holds the picked path')
   const listCalls = calls.filter((c) => c.url.includes('/list?'))
-  assert.ok(listCalls.length >= 1, 'refresh fired for the picked repo')
   assert.ok(listCalls.at(-1).url.includes(encodeURIComponent('/picked/repo')), 'refresh targets the picked repo')
   await m.unmount()
 })
 
-t('panel: picking while open updates the repo and refreshes in place', async () => {
+t('panel: pick button cancel keeps the repo input and fires no refresh', async () => {
   const calls = []
-  let pickCount = 0
-  const m = mount({
-    fetch: makeFetch({ calls }),
-    pickDirectory: async () => { pickCount += 1; return pickCount === 1 ? null : '/new/repo' },
-  })
+  const m = mount({ fetch: makeFetch({ calls }), pickDirectory: async () => null })
   await m.render()
-  // first click: the chooser is cancelled → plain toggle opens the panel
   await m.act(async () => { $('.gwt-badge').click() })
   await m.act(async () => {})
   await m.act(async () => {})
-  assert.ok($('.gwt-panel'), 'panel open after a cancelled pick')
-  const before = calls.filter((c) => c.url.includes('/list?')).length
-  // second click: a folder is picked → repo updates, refresh in place
-  await m.act(async () => { $('.gwt-badge').click() })
+  const listsBefore = calls.filter((c) => c.url.includes('/list?')).length
+  const pickBtn = $('[data-action="pick"]')
+  await m.act(async () => { pickBtn.click() })
   await m.act(async () => {})
   await m.act(async () => {})
-  assert.ok($('.gwt-panel'), 'panel stays open after re-picking')
-  assert.equal($('.gwt-repo').value, '/new/repo', 'repo input updated to the picked path')
-  const listCalls = calls.filter((c) => c.url.includes('/list?'))
-  assert.ok(listCalls.length > before, 'a refresh fired for the new repo')
-  assert.ok(listCalls.at(-1).url.includes(encodeURIComponent('/new/repo')), 'refresh targets the newly picked repo')
+  assert.equal($('.gwt-repo').value, '/repo', 'repo input unchanged on cancel')
+  assert.equal(calls.filter((c) => c.url.includes('/list?')).length, listsBefore, 'no extra refresh on cancel')
   await m.unmount()
 })
 
-t('panel: picker failure falls back to the toggle without breaking the panel', async () => {
+t('panel: pick button failure surfaces the error line', async () => {
   const m = mount({ pickDirectory: async () => { throw new Error('native picker unavailable') } })
   await m.render()
   await m.act(async () => { $('.gwt-badge').click() })
   await m.act(async () => {})
   await m.act(async () => {})
-  assert.ok($('.gwt-panel'), 'panel toggles open even when the picker fails')
-  assert.ok(text('.gwt-status').includes('branch main'), 'normal refresh still rendered')
+  const pickBtn = $('[data-action="pick"]')
+  await m.act(async () => { pickBtn.click() })
+  await m.act(async () => {})
+  await m.act(async () => {})
+  assert.ok(text('.gwt-error').includes('native picker unavailable'), 'picker failure shown in the error line')
   await m.unmount()
 })
 
@@ -424,7 +423,7 @@ t('panel: not-a-repo input shows the hint', async () => {
   await m.act(async () => {
     type($('.gwt-repo'), '/not/a/repo')
   })
-  await m.act(async () => { $('.gwt-btn').click() }) // 刷新
+  await m.act(async () => { $('[data-action="refresh"]').click() })
   await m.act(async () => {})
   await m.act(async () => {})
   assert.ok(text('.gwt-note').includes('不是 git repo'), 'not-a-repo hint rendered')
@@ -472,12 +471,12 @@ t('panel: busy state disables the create/open buttons while a refresh is in flig
   await m.act(async () => {})
   assert.ok(!$('.gwt-btnPrimary').disabled, 'create enabled once a name is typed')
   // manual refresh is now gated → busy stays true until released
-  await m.act(async () => { $('.gwt-btn').click() }) // 刷新
+  await m.act(async () => { $('[data-action="refresh"]').click() })
   await new Promise((r) => setTimeout(r, 30))
   await m.act(async () => {})
   assert.ok($('.gwt-btnPrimary').disabled, 'create-bound disabled while busy')
   assert.ok([...document.querySelectorAll('button')].find((b) => b.textContent.includes('仅创建工作树')).disabled, 'worktree-only disabled while busy')
-  assert.ok(text('.gwt-btn').includes('…'), 'refresh shows the busy ellipsis')
+  assert.ok(text('[data-action="refresh"]').includes('…'), 'refresh shows the busy ellipsis')
   release()
   await m.act(async () => {})
   await m.act(async () => {})
@@ -493,7 +492,7 @@ t('panel: switching the repo input and refreshing targets the new repo', async (
   await m.act(async () => {})
   await m.act(async () => {})
   await m.act(async () => { type($('.gwt-repo'), '/other/repo') })
-  await m.act(async () => { $('.gwt-btn').click() }) // 刷新
+  await m.act(async () => { $('[data-action="refresh"]').click() })
   await m.act(async () => {})
   await m.act(async () => {})
   const listCalls = calls.filter((c) => c.url.includes('/list?'))

@@ -6,7 +6,7 @@ Conversation↔worktree **binding** for **DeepSeek Harness**: run multiple conve
 
 - **绑定 / Binding** — 会话在创建时即绑定到专属工作树：工作树 + 工作区 + 会话一次成型（绑定关系可推导、可展示、可清理）。
 - **Agent 工具 / Agent tools** — 9 个工具（`git_session_binding`、`git_repo_status`、`git_worktree_*`、`git_branch_*`），每个会话都可以调用。<br>9 tools (`git_session_binding`, `git_repo_status`, `git_worktree_*`, `git_branch_*`) every conversation can call.
-- **浏览器面板 / Browser panel** — 侧边栏的 **Bindings** 入口：绑定管理器，列出工作树及其绑定的会话，一键创建绑定会话，删除时警告并可选归档绑定会话。点击 **Bindings** 会先打开**系统文件夹选择器**，直接选中工作目录（repo 路径）；取消则照常开关面板。<br>A sidebar **Bindings** entry: the binding manager — lists worktrees with their bound conversations, creates a bound conversation in one click, and warns about (optionally archiving) bound conversations on removal. Clicking **Bindings** opens the **OS folder chooser** first, so the working directory (the repo path) is picked instead of typed; cancelling toggles the panel as before.
+- **浏览器面板 / Browser panel** — 侧边栏的 **Bindings** 入口：绑定管理器，列出工作树及其绑定的会话，一键创建绑定会话，删除时警告并可选归档绑定会话。<br>A sidebar **Bindings** entry: the binding manager — lists worktrees with their bound conversations, creates a bound conversation in one click, and warns about (optionally archiving) bound conversations on removal.
 
 ## 绑定是什么 / What a binding is
 
@@ -88,17 +88,17 @@ All tools accept `repo` (default: the session workspace; a relative path resolve
 
 ## 面板 / Panel
 
-浏览器端注册到 `sidebar.footer.action`（侧边栏底部）：一个 **Bindings** 按钮。点击按钮先打开**系统文件夹选择器**（宿主 `directoryPicker` 的 `native` 能力——macOS `osascript`、Linux Zenity/KDialog、Windows `IFileOpenDialog`），选中的目录即成为面板操作的仓库路径（repo 输入框自动填入，面板随之打开/刷新）；取消或宿主只提供 `browse` 选择器时，退化为原来的开/关面板切换，仓库路径仍可手动输入。面板内容：
+浏览器端注册到 `sidebar.footer.action`（侧边栏底部）：一个 **Bindings** 按钮，点击打开**绑定管理器**。仓库路径输入框**右侧**有一个 **选择目录** 按钮：点击打开**系统文件夹选择器**（宿主 `directoryPicker` 的 `native` 能力——macOS `osascript`、Linux Zenity/KDialog、Windows `IFileOpenDialog`），选中的目录自动填入输入框并刷新面板；取消则不改变当前输入。面板内容：
 
-- 仓库路径输入框（默认取当前会话的工作区），
+- 仓库路径输入框（默认取当前会话的工作区）+ **选择目录** 按钮（系统文件夹选择器），
 - 状态行：当前分支 + 干净/脏文件；本会话绑定状态（已绑定工作树 / 共享主工作树 / 不在仓库），
 - 工作树列表：路径、分支 @ HEAD、`primary` / `当前会话` / `N 会话绑定` 标记、绑定的会话标题；每行 **打开绑定会话**（非主工作树）与 **删除**，
 - 创建表单：功能名 → **创建绑定会话**（一键，见上）或 **仅创建工作树**，
 - 删除确认：列出绑定的会话，勾选"一并归档这些会话"后删除。
 
-The browser half registers into `sidebar.footer.action` (bottom of the sidebar): a **Bindings** button. Clicking it first opens the **OS folder chooser** (the host `directoryPicker` `native` capability — macOS `osascript`, Linux Zenity/KDialog, Windows `IFileOpenDialog`); the chosen directory becomes the repo path the panel operates on (the repo input is filled and the panel opens/refreshes). Cancelling — or a host that only composes the `browse` picker — falls back to the plain open/close toggle, and the repo path stays manually editable. The panel shows
+The browser half registers into `sidebar.footer.action` (bottom of the sidebar): a **Bindings** button opening the **binding manager**. To the **right of the repo path input** sits a **选择目录 (Pick folder)** button: it opens the **OS folder chooser** (the host `directoryPicker` `native` capability — macOS `osascript`, Linux Zenity/KDialog, Windows `IFileOpenDialog`), fills the input with the chosen directory and refreshes the panel; cancelling leaves the input untouched. The panel shows
 
-- repo path input (defaults to the current session's workspace),
+- repo path input (defaults to the current session's workspace) + **选择目录 (Pick folder)** button (OS folder chooser),
 - status line: branch + clean/dirty; this session's binding state (dedicated worktree / shared primary / not a repo),
 - worktree list: path, branch @ HEAD, `primary` / `this session` / `N bound` markers, bound session titles; per-row **打开绑定会话 (Open bound conversation)** (non-primary) and **删除 (Remove)**,
 - create form: feature name → **创建绑定会话 (Create bound conversation)** (one click, above) or **仅创建工作树 (worktree only)**,
@@ -163,7 +163,7 @@ node test/routes-http.js # 真实 HTTP：方法校验（含 HEAD/OPTIONS）、�
                          # 严格 vs 宽容 notARepo、超时 abort
 node test/client-unit.js # 客户端纯函数：sanitizeName 边界（切片尾点、HEAD、代理对、check-ref-format 性质测试）、
                          # sessionsSame、api() 错误映射
-node test/client-dom.js  # jsdom 面板交互：目录选择器选择/取消/失败回退、创建/打开绑定会话、删除+归档、
+node test/client-dom.js  # jsdom 面板交互：选择目录按钮（选择/取消/失败）、创建/打开绑定会话、删除+归档、
                          # 点击外部关闭、刷新合并、失败渲染、busy 禁用、repo 切换、会话打开失败提示
 node test/flows.js       # 真实用户操作流：一键绑定会话、agent 准备/开发者打开、全生命周期、跨仓库、
                          # unborn 仓库首绑、双面板同名竞态
