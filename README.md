@@ -67,7 +67,7 @@ All tools accept `repo` (default: the session workspace; a relative path resolve
 | `git_session_binding` | **开场必查**：本会话的绑定——仓库、所在工作树、检出分支、peer 工作树。`bound` 仅在拥有专属（非主）工作树时为 true。 |
 | `git_repo_status` | 分支、领先/落后、脏文件；查询本会话所在仓库时附带 `binding` 块。 |
 | `git_worktree_list` | 列出所有工作树（含分支/HEAD），标记 `主工作树` 与 `当前会话`。 |
-| `git_worktree_add` | 创建工作树。`name` → `<repo>/.dsh-wt/<name>`（**锚定主仓库根**，从工作树内创建也不会嵌套）；或显式 `path`。`unique` 自动去重（`-2`、`-3`…）；显式 `newBranch` 冲突则报 git 原错。 |
+| `git_worktree_add` | 创建工作树。`name` → `<repo>/.dsh-wt/<name>`（**锚定主仓库根**，从工作树内创建也不会嵌套）；或显式 `path`。`unique` 自动去重（`-2`、`-3`…）；显式 `newBranch` 冲突则报 git 原错。⚠️ 显式 `path` 建在仓库外时，侧边栏不会把它嵌套在项目文件夹下（见下文"工作树目录位置决定树形"）。 |
 | `git_worktree_remove` | 删除工作树（分支保留）。只接受已注册的工作树；主工作树会被拒绝；`force` 可删除含未提交改动的工作树。 |
 | `git_branch_list` | 列出分支：短 sha、检出标记（调用者所在工作树的 HEAD）、上游；`all` 包含远程分支。 |
 | `git_branch_create` | 创建分支；`switch` 立即检出；`from` 指定基于哪个提交/分支。 |
@@ -79,7 +79,7 @@ All tools accept `repo` (default: the session workspace; a relative path resolve
 | `git_session_binding` | **Call first**: this conversation's binding — repo, the worktree its workspace lives in, the checked-out branch, peer worktrees. `bound` is true only with a dedicated (non-primary) worktree. |
 | `git_repo_status` | Branch, ahead/behind, dirty entries; attaches the session's `binding` when querying its own repo. |
 | `git_worktree_list` | Every worktree with branch/HEAD, marked `primary` and `this session`. |
-| `git_worktree_add` | Create a worktree. `name` → `<repo>/.dsh-wt/<name>` (anchored to the **main repo root**, never nested inside the caller's worktree); or explicit `path`. `unique` auto-dedupes (`-2`, `-3`, …); explicit `newBranch` collisions surface git's error. |
+| `git_worktree_add` | Create a worktree. `name` → `<repo>/.dsh-wt/<name>` (anchored to the **main repo root**, never nested inside the caller's worktree); or explicit `path`. `unique` auto-dedupes (`-2`, `-3`, …); explicit `newBranch` collisions surface git's error. ⚠️ A worktree created outside the repo via explicit `path` will not nest under the project folder in the sidebar (see "Placement decides the tree shape" below). |
 | `git_worktree_remove` | Remove a worktree (branch kept). Only registered worktrees accepted; the primary worktree is refused; `force` removes uncommitted changes. |
 | `git_branch_list` | Branches with short sha, checked-out marker (the caller worktree's HEAD), upstream; `all` includes remotes. |
 | `git_branch_create` | Create a branch; `switch` checks it out; `from` picks the base. |
@@ -111,6 +111,7 @@ Sync is **coalesced**: at most one scan in flight, later requests folded into a 
 插件还注册到 `sidebar.workspaces.create`（工作区浏览器每行「+」的可替换链），并结合 `sidebar.footer.action` 的自动同步，让左侧工作区树成为**完整的绑定管理界面**：
 
 - **树结构**：核心 `ui-workspace` 按目录包含关系把工作区嵌套渲染——`<repo>/.dsh-wt/<name>` 自动成为 `<repo>` 主文件夹下的副文件夹，其会话显示在副文件夹里。自动同步保证**每个工作树（包括从未打开过会话的）都注册成副文件夹**；主工作树的路径就是仓库根，因此项目文件夹即主工作树，标题标记为 **`<项目名>（主工作树）`**。
+- **⚠️ 工作树目录位置决定树形**：核心按**路径包含关系**嵌套渲染（工作区路径还是 realpath 规范化的），所以"显示在主工作树子目录下"的效果**只有工作树目录位于主仓库根之内**（`<repo>/.dsh-wt/<name>`）时才成立。若用 `git_worktree_add` 的显式 `path` 把工作树建在仓库**外面**（如同级目录 `<repo 的父目录>/<name>`），该工作树仍会被自动检测、注册并显示在侧边栏，但只能作为**独立的顶层文件夹**（会话绑定、分支显示、删除工作树等其余能力不受影响）——它**不会**嵌套在项目文件夹下。需要嵌套展示时，请把工作树放在 `<repo>/.dsh-wt/` 下。
 - **主文件夹 ＋（仓库）**：弹出「新增工作树」小窗，输入功能名 → **创建绑定会话**（创建 `.dsh-wt/<name>` 工作树并立即创建/打开绑定会话，一键）或 **仅创建工作树**；非 git 目录的文件夹自动回落为默认「新建会话」。
 - **副文件夹 ＋（工作树）**：保持核心默认行为——在该工作树新建会话（会话出生即绑定）。
 - **副文件夹 删除工作树**（仅已检测到的工作树）：确认框列出绑定的会话，勾选"一并归档这些会话"后删除 git 工作树并注销其文件夹；工作树从 git 消失（agent/CLI 删除）后，无会话的文件夹由同步自动清理。
@@ -118,6 +119,7 @@ Sync is **coalesced**: at most one scan in flight, later requests folded into a 
 The plugin also registers into `sidebar.workspaces.create` (the replaceable per-row 「+」 chain of the workspace browser) and pairs it with the `sidebar.footer.action` auto-sync, making the sidebar tree the **complete binding-management surface**:
 
 - **Tree shape**: core `ui-workspace` nests workspaces by directory containment — `<repo>/.dsh-wt/<name>` renders as a subfolder under the `<repo>` main folder, with its conversations inside. The auto-sync guarantees **every worktree (even never-opened ones) is registered as a subfolder**; the main worktree's path IS the repo root, so the project folder is the main worktree, titled **`<project>（主工作树）`**.
+- **⚠️ Placement decides the tree shape**: the core nests by **path containment** (workspace paths are realpath-canonical), so the "shown under the main worktree" effect holds **only when the worktree directory lives inside the main repo root** (`<repo>/.dsh-wt/<name>`). A worktree created **outside** the repo (e.g. a sibling directory `<parent>/<name>`) via an explicit `git_worktree_add` `path` is still auto-detected, registered and shown in the sidebar — but as its own **top-level folder** (binding, branch display and remove-worktree all keep working); it does **not** nest under the project folder. For the nested display, place worktrees under `<repo>/.dsh-wt/`.
 - **Main folder ＋ (repo)**: opens a small "add worktree" popover — feature name → **创建绑定会话 (create bound conversation)** (creates `.dsh-wt/<name>` and immediately creates/opens the bound conversation, one click) or **仅创建工作树 (worktree only)**; non-git folders automatically fall back to the default new-session ＋.
 - **Subfolder ＋ (worktree)**: keeps the core default — a new conversation born bound to that worktree.
 - **Subfolder 删除工作树 (Remove worktree)** (detected worktrees only): the confirm lists bound conversations, checkbox to **archive them**, then removes the git worktree and unregisters the folder; worktrees removed on the git side (agent/CLI) are swept by the sync when their folder holds no sessions.
