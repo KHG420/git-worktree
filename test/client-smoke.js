@@ -74,6 +74,7 @@ const fakeCtx = {
           return 's-new'
         },
         archiveSession: async (id) => { archived.push(id) },
+        pickDirectory: async () => '/repo',
       }
     }
     if (key === 'sessions') {
@@ -96,6 +97,7 @@ assert.equal(registered.id, 'git-worktree-panel')
 const face = registered.inject()
 assert.equal(typeof face.openBoundSession, 'function', 'inject face exposes openBoundSession')
 assert.equal(typeof face.archiveSessions, 'function', 'inject face exposes archiveSessions')
+assert.equal(typeof face.pickDirectory, 'function', 'inject face exposes pickDirectory')
 
 // The openBoundSession flow: workspace.create -> workspace.connectWorkspace -> sessions.open.
 const result = await face.openBoundSession('/repo/.dsh-wt/feature-a')
@@ -106,12 +108,15 @@ assert.equal(openedSessionId, 's-new', 'connected session selected via sessions.
 await face.archiveSessions(['s1', 's2'])
 assert.deepEqual(archived, ['s1', 's2'], 'archiveSessions archives each id')
 
+// The pickDirectory flow forwards to the workspace service (host OS chooser).
+assert.equal(await face.pickDirectory(), '/repo', 'pickDirectory forwards to the workspace service')
+
 // SSR-render the closed component (open state starts false; effects do not run in SSR).
 const Component = registered.component
 // Real SessionListState shape: { ids, byId, current, ... } — no items array.
 const useSessions = (selector) => selector({ ids: ['s1'], byId: { s1: { id: 's1', cwd: '/repo', displayTitle: 'repo' } }, current: 's1' })
 const html = renderToStaticMarkup(
-  React.createElement(Component, { wide: true, useSessions, openBoundSession: face.openBoundSession, archiveSessions: face.archiveSessions })
+  React.createElement(Component, { wide: true, useSessions, openBoundSession: face.openBoundSession, archiveSessions: face.archiveSessions, pickDirectory: face.pickDirectory })
 )
 assert.ok(html.includes('gwt-badge'), 'renders the footer badge')
 assert.ok(html.includes('Bindings'), 'renders the label')

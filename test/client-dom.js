@@ -103,7 +103,7 @@ function makeFetch({ calls = [], delays = {}, variants = {} } = {}) {
 }
 
 // ── mount helper ────────────────────────────────────────────────────────────
-function mount({ fetch, snapshot: snapOverride, openBoundSession, archiveSessions } = {}) {
+function mount({ fetch, snapshot: snapOverride, openBoundSession, archiveSessions, pickDirectory } = {}) {
   const calls = []
   globalThis.fetch = fetch ?? makeFetch({ calls })
   const mounted = { component: null, container: document.getElementById('root') }
@@ -145,6 +145,9 @@ function mount({ fetch, snapshot: snapOverride, openBoundSession, archiveSession
         useSessions,
         openBoundSession: openBoundSession ?? (async (p) => ({ ok: true, sessionId: 's-new', path: p })),
         archiveSessions: archiveSessions ?? (async () => {}),
+        // Default: the OS chooser is "cancelled", so a badge click falls back
+        // to the plain open/close toggle — the pre-picker behavior.
+        pickDirectory: pickDirectory ?? (async () => null),
       }))
     })
   }
@@ -196,6 +199,58 @@ t('panel: opens on badge click, refreshes once, renders worktrees + bindings', a
   assert.ok(text('.gwt-panel').includes('1 会话绑定'), 'bound count tag')
   assert.ok(text('.gwt-panel').includes('feat-a'), 'bound session title shown')
   assert.ok(text('.gwt-panel').includes('当前会话'), 'current-session tag')
+  await m.unmount()
+})
+
+t('panel: badge click picks a folder → repo input set, panel opens on it', async () => {
+  const calls = []
+  const m = mount({ fetch: makeFetch({ calls }), pickDirectory: async () => '/picked/repo' })
+  await m.render()
+  await m.act(async () => { $('.gwt-badge').click() })
+  await m.act(async () => {})
+  await m.act(async () => {})
+  assert.ok($('.gwt-panel'), 'panel opens after picking a folder')
+  assert.equal($('.gwt-repo').value, '/picked/repo', 'repo input holds the picked path')
+  const listCalls = calls.filter((c) => c.url.includes('/list?'))
+  assert.ok(listCalls.length >= 1, 'refresh fired for the picked repo')
+  assert.ok(listCalls.at(-1).url.includes(encodeURIComponent('/picked/repo')), 'refresh targets the picked repo')
+  await m.unmount()
+})
+
+t('panel: picking while open updates the repo and refreshes in place', async () => {
+  const calls = []
+  let pickCount = 0
+  const m = mount({
+    fetch: makeFetch({ calls }),
+    pickDirectory: async () => { pickCount += 1; return pickCount === 1 ? null : '/new/repo' },
+  })
+  await m.render()
+  // first click: the chooser is cancelled → plain toggle opens the panel
+  await m.act(async () => { $('.gwt-badge').click() })
+  await m.act(async () => {})
+  await m.act(async () => {})
+  assert.ok($('.gwt-panel'), 'panel open after a cancelled pick')
+  const before = calls.filter((c) => c.url.includes('/list?')).length
+  // second click: a folder is picked → repo updates, refresh in place
+  await m.act(async () => { $('.gwt-badge').click() })
+  await m.act(async () => {})
+  await m.act(async () => {})
+  assert.ok($('.gwt-panel'), 'panel stays open after re-picking')
+  assert.equal($('.gwt-repo').value, '/new/repo', 'repo input updated to the picked path')
+  const listCalls = calls.filter((c) => c.url.includes('/list?'))
+  assert.ok(listCalls.length > before, 'a refresh fired for the new repo')
+  assert.ok(listCalls.at(-1).url.includes(encodeURIComponent('/new/repo')), 'refresh targets the newly picked repo')
+  await m.unmount()
+})
+
+t('panel: picker failure falls back to the toggle without breaking the panel', async () => {
+  const m = mount({ pickDirectory: async () => { throw new Error('native picker unavailable') } })
+  await m.render()
+  await m.act(async () => { $('.gwt-badge').click() })
+  await m.act(async () => {})
+  await m.act(async () => {})
+  assert.ok($('.gwt-panel'), 'panel toggles open even when the picker fails')
+  assert.ok(text('.gwt-status').includes('branch main'), 'normal refresh still rendered')
   await m.unmount()
 })
 
