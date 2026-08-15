@@ -2,7 +2,7 @@
 
 面向 **DeepSeek Harness** 的 **对话 ↔ 工作树绑定** 插件：让多个会话在同一项目上并行工作，**每个会话绑定一个独立 git 工作树 + 分支**，一键创建、互不干扰。
 
-Conversation↔worktree **binding** for **DeepSeek Harness**: run multiple conversations on one project in parallel, each bound to its own isolated git worktree + branch, created in one click.
+DeepSeek Harness plugin: bind every conversation to its own isolated git worktree + branch in one click, so parallel agents work on one repo without interference — binding manager panel + 9 git tools.
 
 - **绑定 / Binding** — 会话在创建时即绑定到专属工作树：工作树 + 工作区 + 会话一次成型（绑定关系可推导、可展示、可清理）。
 - **Agent 工具 / Agent tools** — 9 个工具（`git_session_binding`、`git_repo_status`、`git_worktree_*`、`git_branch_*`），每个会话都可以调用。<br>9 tools (`git_session_binding`, `git_repo_status`, `git_worktree_*`, `git_branch_*`) every conversation can call.
