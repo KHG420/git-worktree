@@ -1,7 +1,7 @@
 {
   "name": "dsh-git-worktree",
   "version": "0.2.0",
-  "description": "Conversation↔worktree binding for DeepSeek Harness: one-click isolated worktree + branch per conversation, with a binding manager panel",
+  "description": "Conversation↔worktree binding for DeepSeek Harness: every project's git worktrees live in the sidebar workspace tree as nested folders (main worktree marked 主工作树), with one-click worktree+session creation and in-tree removal",
   "type": "module",
   "main": "index.js",
   "exports": {

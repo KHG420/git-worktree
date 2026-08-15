@@ -2,7 +2,11 @@
  * Browser-half smoke test: loads client.js through a simulated
  * `window.__ModuleLoader__.load`, materializes the factory with a fake
  * require over the real react packages, runs the client apply against a fake
- * ctx, and SSR-renders the registered panel component to prove it mounts.
+ * ctx, and SSR-renders the registered components to prove they mount.
+ *
+ * The Bindings panel is gone: the footer slot hosts a renderless sync mount
+ * (renders nothing) and the workspace-tree create chain hosts the per-row
+ * worktree affordances.
  *
  * Run: node test/client-smoke.js
  */
@@ -43,16 +47,17 @@ assert.deepEqual(moduleExports.inject, ['sessions', 'workspaces', 'slots'], 'cli
 
 // Run apply against a fake client ctx.
 const injections = []
-let registered = null
+const registered = []
 let openedSessionId = null
 let archived = []
+let deleted = []
 const fakeCtx = {
   slots: {
     inject: (slot, callback) => {
       injections.push({ slot, callback })
     },
     register: (options, component) => {
-      registered = { ...options, component }
+      registered.push({ ...options, component })
       return () => {}
     },
   },
@@ -74,7 +79,8 @@ const fakeCtx = {
           return 's-new'
         },
         archiveSession: async (id) => { archived.push(id) },
-        pickDirectory: async () => '/repo',
+        rename: async (id, title) => ({ workspaceId: id, path: '/repo', title, sessionIds: [], createdAt: '', updatedAt: '' }),
+        delete: async (id) => { deleted.push(id) },
       }
     }
     if (key === 'sessions') {
@@ -85,41 +91,99 @@ const fakeCtx = {
 }
 moduleExports.apply(fakeCtx)
 
-assert.equal(injections.length, 1, 'one slot injection registered')
-assert.equal(injections[0].slot, 'sidebar.footer.action')
+assert.equal(injections.length, 2, 'two slot injections registered')
+const slots = injections.map((i) => i.slot)
+assert.deepEqual(slots, ['sidebar.footer.action', 'sidebar.workspaces.create'])
 
-const disposer = injections[0].callback()
-assert.equal(typeof disposer, 'function', 'register returns a disposer')
-assert.ok(registered, 'register called with the panel')
-assert.equal(registered.name, 'sidebar.footer.action')
-assert.equal(registered.id, 'git-worktree-panel')
+for (const injection of injections) injection.callback()
+const footer = registered.find((r) => r.name === 'sidebar.footer.action')
+const chain = registered.find((r) => r.name === 'sidebar.workspaces.create')
+assert.ok(footer, 'footer sync entry registered')
+assert.equal(footer.id, 'git-worktree-sync')
+assert.equal(typeof footer.component, 'function')
+assert.ok(chain, 'tree create chain entry registered')
+assert.equal(typeof chain.component, 'function')
+assert.equal(typeof chain.select, 'function')
 
-const face = registered.inject()
-assert.equal(typeof face.openBoundSession, 'function', 'inject face exposes openBoundSession')
-assert.equal(typeof face.archiveSessions, 'function', 'inject face exposes archiveSessions')
-assert.equal(typeof face.pickDirectory, 'function', 'inject face exposes pickDirectory')
+// Inject faces.
+const footerFace = footer.inject()
+const chainFace = chain.inject()
+assert.equal(typeof footerFace.sync.list, 'function', 'sync face exposes list')
+assert.equal(typeof footerFace.sync.create, 'function', 'sync face exposes create')
+assert.equal(typeof footerFace.sync.rename, 'function', 'sync face exposes rename')
+assert.equal(typeof footerFace.sync.delete, 'function', 'sync face exposes delete')
+assert.equal(typeof chainFace.openBoundSession, 'function', 'chain face exposes openBoundSession')
+assert.equal(typeof chainFace.archiveSessions, 'function', 'chain face exposes archiveSessions')
+assert.equal(typeof chainFace.sync, 'object', 'chain face exposes the sync face')
+
+// Chain selector routing: top-level rows match (with topLevel flag), nested
+// rows match, the ungrouped bucket declines.
+const select = chain.select
+assert.deepEqual(
+  select({ group: { workspaceId: 'w1', cwd: '/repo', label: 'repo', parentWorkspaceId: undefined } }),
+  { workspaceId: 'w1', cwd: '/repo', label: 'repo', topLevel: true },
+  'top-level row matched',
+)
+assert.deepEqual(
+  select({ group: { workspaceId: 'w2', cwd: '/repo/.dsh-wt/dev', label: 'dev', parentWorkspaceId: 'w1' } }),
+  { workspaceId: 'w2', cwd: '/repo/.dsh-wt/dev', label: 'dev', topLevel: false },
+  'nested row matched with topLevel false',
+)
+assert.equal(select({ group: { workspaceId: undefined, cwd: undefined, label: 'ungrouped' } }), null, 'ungrouped declines')
 
 // The openBoundSession flow: workspace.create -> workspace.connectWorkspace -> sessions.open.
-const result = await face.openBoundSession('/repo/.dsh-wt/feature-a')
+const result = await chainFace.openBoundSession('/repo/.dsh-wt/feature-a')
 assert.deepEqual(result, { ok: true, sessionId: 's-new' }, 'openBoundSession returns ok with the session id')
 assert.equal(openedSessionId, 's-new', 'connected session selected via sessions.open')
 
 // The archiveSessions flow forwards to the workspace service.
-await face.archiveSessions(['s1', 's2'])
+await chainFace.archiveSessions(['s1', 's2'])
 assert.deepEqual(archived, ['s1', 's2'], 'archiveSessions archives each id')
 
-// The pickDirectory flow forwards to the workspace service (host OS chooser).
-assert.equal(await face.pickDirectory(), '/repo', 'pickDirectory forwards to the workspace service')
+// The sync face forwards mutations to the workspace service.
+await footerFace.sync.delete('w9')
+assert.deepEqual(deleted, ['w9'], 'sync.delete forwards to the workspace service')
 
-// SSR-render the closed component (open state starts false; effects do not run in SSR).
-const Component = registered.component
-// Real SessionListState shape: { ids, byId, current, ... } — no items array.
-const useSessions = (selector) => selector({ ids: ['s1'], byId: { s1: { id: 's1', cwd: '/repo', displayTitle: 'repo' } }, current: 's1' })
-const html = renderToStaticMarkup(
-  React.createElement(Component, { wide: true, useSessions, openBoundSession: face.openBoundSession, archiveSessions: face.archiveSessions, pickDirectory: face.pickDirectory })
+// SSR-render the sync mount (renderless; effects do not run in SSR).
+const SyncComponent = footer.component
+const useWorkspaces = (selector) => selector({ items: [], phase: 'pending', state: 'idle', archivedSessionIds: [], baselinesReady: false, recentWorkspaceId: undefined, error: null })
+const syncHtml = renderToStaticMarkup(
+  React.createElement(SyncComponent, { useWorkspaces, sync: footerFace.sync })
 )
-assert.ok(html.includes('gwt-badge'), 'renders the footer badge')
-assert.ok(html.includes('Bindings'), 'renders the label')
-assert.ok(!html.includes('gwt-panel'), 'panel closed by default')
+assert.equal(syncHtml, '', 'the sync mount renders nothing')
 
-console.log('✅ client bundle loads, registers sidebar.footer.action, and renders')
+// SSR-render the chain component for a top-level repo row: the ＋ renders,
+// no popover.
+const ChainComponent = chain.component
+const useSessions = (selector, isEqual) => selector({ ids: ['s1'], byId: { s1: { id: 's1', cwd: '/repo', displayTitle: 'repo', origin: 'user', blank: false, running: false } }, current: 's1' })
+const rowHtml = renderToStaticMarkup(
+  React.createElement(ChainComponent, {
+    group: { workspaceId: 'w1', cwd: '/repo', label: 'repo', parentWorkspaceId: undefined },
+    defaultCreate: () => {},
+    matched: { workspaceId: 'w1', cwd: '/repo', label: 'repo', topLevel: true },
+    useSessions,
+    openBoundSession: chainFace.openBoundSession,
+    archiveSessions: chainFace.archiveSessions,
+    sync: chainFace.sync,
+  })
+)
+assert.ok(rowHtml.includes('gwt-rowPlus'), 'repo row renders the ＋ affordance')
+assert.ok(!rowHtml.includes('gwt-createPop'), 'popover closed initially')
+assert.ok(!rowHtml.includes('gwt-rowRemove'), 'no delete button on a top-level repo row')
+
+// SSR-render a nested worktree row: no delete button while the store is empty.
+const nestedHtml = renderToStaticMarkup(
+  React.createElement(ChainComponent, {
+    group: { workspaceId: 'w2', cwd: '/repo/.dsh-wt/dev', label: 'dev', parentWorkspaceId: 'w1' },
+    defaultCreate: () => {},
+    matched: { workspaceId: 'w2', cwd: '/repo/.dsh-wt/dev', label: 'dev', topLevel: false },
+    useSessions,
+    openBoundSession: chainFace.openBoundSession,
+    archiveSessions: chainFace.archiveSessions,
+    sync: chainFace.sync,
+  })
+)
+assert.ok(nestedHtml.includes('gwt-rowPlus'), 'nested row renders the ＋ affordance')
+assert.ok(!nestedHtml.includes('gwt-rowRemove'), 'delete button gated on the worktree store')
+
+console.log('✅ client bundle loads, registers footer sync + tree chain, and renders')

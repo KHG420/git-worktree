@@ -1,8 +1,10 @@
 /**
  * Client-half unit tests: loads the real browser bundle and exercises the
- * pure helpers the panel uses — sanitizeName (git-ref-safe naming, boundary
- * matrix), sessionsSame (content equality for the sessions feed), and api()
- * (route error mapping against a stubbed fetch).
+ * pure helpers the plugin uses — sanitizeName (git-ref-safe naming, boundary
+ * matrix), sessionsSame (content equality for the sessions feed), api()
+ * (route error mapping against a stubbed fetch), and runSync (the worktree
+ * auto-detect engine: registration, 主工作树 marker, stale sweep,
+ * coalescing).
  *
  * Run: node test/client-unit.js
  */
@@ -12,13 +14,21 @@ import { pathToFileURL } from 'node:url'
 import { createRequire } from 'node:module'
 import React from 'react'
 import * as jsxRuntime from 'react/jsx-runtime'
-import { renderToStaticMarkup } from 'react-dom/server'
 
 const require = createRequire(import.meta.url)
 
 let passed = 0
 const tests = []
 const t = (name, fn) => tests.push([name, fn])
+
+// localStorage shim (the browser half persists its auto-created workspace ids
+// there; the stale sweep depends on it).
+const storage = new Map()
+globalThis.localStorage = {
+  getItem: (k) => (storage.has(k) ? storage.get(k) : null),
+  setItem: (k, v) => storage.set(k, String(v)),
+  removeItem: (k) => storage.delete(k),
+}
 
 // ── load the real bundle ────────────────────────────────────────────────────
 let captured = null
@@ -36,7 +46,8 @@ const fakeRequire = (spec) => {
   if (spec === 'react/jsx-runtime') return jsxRuntime
   throw new Error(`unexpected require: ${spec}`)
 }
-const { sanitizeName, sessionsSame, api } = captured.factory(fakeRequire)._test
+const testSurface = captured.factory(fakeRequire)._test
+const { sanitizeName, sessionsSame, api, runSync, worktreeStore, loadAuto, saveAuto, _reset } = testSurface
 
 // ── sanitizeName ────────────────────────────────────────────────────────────
 
@@ -215,43 +226,144 @@ t('api: ok:true but non-2xx is treated as failure', async () => {
   await assert.rejects(() => api('/x'), (e) => e.message === 'HTTP 200')
 })
 
-// ── SSR: closed badge renders, panel hidden ─────────────────────────────────
+// ── runSync: the worktree auto-detect engine ────────────────────────────────
 
-t('panel: SSR renders the badge, not the panel', () => {
-  const Component = captured.factory(fakeRequire).apply ? null : null // not needed here
-  const exports_ = captured.factory(fakeRequire)
-  const panel = exports_.inject ? null : null
-  void Component
-  void panel
-  // reuse the smoke-test rendering approach
-  const GitWorktreePanel = (() => {
-    // pull the component out of a registered slot like the smoke test does
-    let registered = null
-    const fakeCtx = {
-      slots: {
-        inject: (slot, callback) => callback(),
-        register: (options, component) => {
-          registered = { ...options, component }
-          return () => {}
-        },
-      },
-      get: () => undefined,
-    }
-    exports_.apply(fakeCtx)
-    return registered.component
-  })()
-  const useSessions = (selector) => selector({ ids: ['s1'], byId: { s1: { id: 's1', cwd: '/repo', displayTitle: 'repo' } }, current: 's1' })
-  const html = renderToStaticMarkup(
-    React.createElement(GitWorktreePanel, {
-      wide: true,
-      useSessions,
-      openBoundSession: async () => ({ ok: true }),
-      archiveSessions: async () => {},
-    }),
-  )
-  assert.ok(html.includes('gwt-badge'))
-  assert.ok(html.includes('Bindings'))
-  assert.ok(!html.includes('gwt-panel'))
+const REPO = '/repo'
+const FEAT = '/repo/.dsh-wt/feat-a' // length 22
+const W = (id, path, extra = {}) => ({ workspaceId: id, path, title: path.split('/').pop(), sessionIds: [], createdAt: '', updatedAt: '', ...extra })
+
+function syncFace(worktrees, { log = [], failList = false } = {}) {
+  const byPath = new Map()
+  for (const wt of worktrees) byPath.set(wt.absolutePath, wt)
+  let n = 0
+  return {
+    byPath,
+    async list() {
+      if (failList) throw new Error('list boom')
+      return { notARepo: false, root: REPO, worktrees }
+    },
+    async create({ path }) {
+      n += 1
+      const id = `w-auto-${n}`
+      log.push(['create', path])
+      return W(id, path)
+    },
+    async rename(id, title) {
+      log.push(['rename', id, title])
+      return W(id, REPO, { title })
+    },
+    async delete(id) {
+      log.push(['delete', id])
+    },
+  }
+}
+
+const MAIN_WT = { path: '.', absolutePath: REPO, branch: 'main', head: 'aaa', primary: true }
+const FEAT_WT = { path: '.dsh-wt/feat-a', absolutePath: FEAT, branch: 'feat-a', head: 'bbb', primary: false }
+
+t('runSync: registers linked worktrees and marks the main worktree', async () => {
+  _reset()
+  const log = []
+  const face = syncFace([MAIN_WT, FEAT_WT], { log })
+  const out = await runSync([W('w1', REPO)], face)
+  assert.equal(out.repos, 1)
+  assert.deepEqual(log, [
+    ['rename', 'w1', 'repo（主工作树）'],
+    ['create', FEAT],
+  ], 'main worktree marked, linked worktree registered')
+  assert.ok(loadAuto().has('w-auto-1'), 'auto-created id persisted')
+  assert.equal(worktreeStore.state.byPath.get(REPO).primary, true)
+  assert.equal(worktreeStore.state.byPath.get(FEAT).primary, false)
+  assert.equal(worktreeStore.state.byPath.get(FEAT).repoRoot, REPO)
+  assert.deepEqual(worktreeStore.state.roots.get(REPO), [REPO, FEAT])
+  _reset()
+})
+
+t('runSync: a custom main-worktree title is never overwritten', async () => {
+  _reset()
+  const log = []
+  const face = syncFace([MAIN_WT], { log })
+  await runSync([W('w1', REPO, { title: '我的项目' })], face)
+  assert.deepEqual(log, [], 'no rename for a custom title')
+  _reset()
+})
+
+t('runSync: stale sweep unregisters a sessionless worktree that left git', async () => {
+  _reset()
+  const log = []
+  const face = syncFace([MAIN_WT], { log })
+  saveAuto(new Set(['w2']))
+  await runSync([W('w1', REPO, { title: 'repo（主工作树）' }), W('w2', FEAT)], face)
+  assert.deepEqual(log, [['delete', 'w2']], 'stale sessionless worktree unregistered')
+  assert.ok(!loadAuto().has('w2'), 'id dropped from the auto registry')
+  _reset()
+})
+
+t('runSync: keeps a stale worktree that still has sessions', async () => {
+  _reset()
+  const log = []
+  const face = syncFace([MAIN_WT], { log })
+  saveAuto(new Set(['w2']))
+  await runSync([W('w1', REPO, { title: 'repo（主工作树）' }), W('w2', FEAT, { sessionIds: ['s9'] })], face)
+  assert.deepEqual(log, [], 'session-bearing worktree kept')
+  _reset()
+})
+
+t('runSync: never sweeps workspaces it did not auto-create', async () => {
+  _reset()
+  const log = []
+  const face = syncFace([MAIN_WT], { log })
+  await runSync([W('w1', REPO), W('w-user', FEAT)], face)
+  assert.deepEqual(log, [['rename', 'w1', 'repo（主工作树）']], 'user workspace untouched')
+  _reset()
+})
+
+t('runSync: a workspace inside a repo but not at the root still discovers the project', async () => {
+  _reset()
+  const log = []
+  const face = syncFace([MAIN_WT, FEAT_WT], { log })
+  // Only the worktree folder is registered — the sync must create the project
+  // folder (marked) so the tree nests correctly.
+  await runSync([W('w2', FEAT)], face)
+  assert.deepEqual(log, [
+    ['create', REPO],
+    ['rename', 'w-auto-1', 'repo（主工作树）'],
+  ], 'project folder created and marked, worktree already registered')
+  _reset()
+})
+
+t('runSync: a failed list call is tolerated per workspace', async () => {
+  _reset()
+  const log = []
+  const okFace = syncFace([MAIN_WT], { log })
+  const face = {
+    ...okFace,
+    list: async () => { throw new Error('list boom') },
+  }
+  const out = await runSync([W('w1', REPO)], face)
+  assert.equal(out.repos, 0, 'repo skipped without failing the pass')
+  assert.deepEqual(log, [], 'no mutations for an unreadable repo')
+  _reset()
+})
+
+t('runSync: coalesces — a call during an in-flight pass is folded in', async () => {
+  _reset()
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  let listCalls = 0
+  const face = syncFace([MAIN_WT], {})
+  face.list = async () => { listCalls += 1; await gate; return { notARepo: false, root: REPO, worktrees: [MAIN_WT] } }
+  const first = runSync([W('w1', REPO)], face)
+  const second = runSync([W('w1', REPO), W('w2', FEAT)], face)
+  const secondResult = await second
+  assert.equal(secondResult.coalesced, true, 'second call folded while the first is in flight')
+  release()
+  await first
+  // the pending re-run fires with the latest inputs (two workspaces → 2 lists)
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  assert.equal(listCalls, 3, 'pending rerun executed with the latest inputs (1 + 2 list calls)')
+  _reset()
 })
 
 // ── sequential runner ───────────────────────────────────────────────────────
