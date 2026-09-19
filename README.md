@@ -88,15 +88,16 @@ All tools accept `repo` (default: the session workspace; a relative path resolve
 
 ## 左侧工作区树：自动检测全部工作树 / The sidebar tree: every worktree auto-detected
 
-右下角的 **Bindings 面板已移除**：工作区树是唯一的管理界面。浏览器端注册两个 slot：
+当前 DSH（0.1.5-rc.2）的 `ui-workspace` 只声明 `sidebar.workspaces.directoryFlow`，**不再有 `sidebar.workspaces.create` 链**。因此浏览器端只注册一个 slot（`sidebar.footer.action`），并从该挂载点直接观察工作区树的 DOM，注入每行控件：
 
-The sidebar footer **Bindings panel is gone**: the workspace tree is the single surface. The browser half registers two slots:
+Current DSH (0.1.5-rc.2) ui-workspace declares only `sidebar.workspaces.directoryFlow`, **not the `sidebar.workspaces.create` chain**. The browser half therefore registers a single slot (`sidebar.footer.action`) and installs the per-row controls directly into the observed tree DOM:
 
-- **`sidebar.footer.action`（渲染为空 / renders nothing）** — 一个无 UI 的同步挂载点。监听工作区列表，对每个工作区调用 `/dsh-git-worktree/list`：确保仓库根（主工作树）工作区存在并标记 **`<项目名>（主工作树）`**，确保每个工作树路径都注册为工作区（树按路径自动嵌套成子文件夹）；**失效清扫**——auto 注册的、工作树已从 git 消失且无会话的文件夹会被自动注销（跟随 git）。20 秒静默轮询覆盖 agent 工具/CLI 在工作树层面的改动。A renderless sync mount. Watches the workspace list, queries `/dsh-git-worktree/list` per workspace: ensures the repo-root (main worktree) workspace exists and is marked **`<project>（主工作树）`**, ensures every worktree path is registered as a workspace (the tree nests them by path); **stale sweep** — auto-registered folders whose worktree disappeared from git and hold no sessions are unregistered again (the tree follows git). A 20s quiet poll covers worktree-level changes made by agent tools/CLI.
-- **`sidebar.workspaces.create`（每行 ＋ 链 / per-row ＋ chain）** —
-  - 主文件夹（仓库）＋ → 「新增工作树」小窗：功能名 → **创建绑定会话** 或 **仅创建工作树**；非 git 文件夹回落为默认「新建会话」。Repo folder ＋ → "add worktree" popover (create bound conversation / worktree only); non-git folders fall back to the default new-session ＋.
-  - 工作树副文件夹 → 默认 ＋（在该工作树新建会话，出生即绑定）+ **删除工作树** 按钮（确认框：绑定会话列表、可一并归档、删除 git 工作树并注销文件夹）。Worktree subfolder → default ＋ (new conversation born bound) + **删除工作树 (Remove worktree)** button (confirm: bound conversations, optional archive, removes the worktree and unregisters the folder).
-  - 其他嵌套文件夹 → 保持默认 ＋。Other nested folders keep the default ＋.
+- **`sidebar.footer.action`（渲染为空 / renders nothing，弹层打开时才渲染）** — 一个无 UI 的同步挂载点。监听工作区列表，对每个工作区调用 `/dsh-git-worktree/list`：确保仓库根（主工作树）工作区存在并标记 **`<项目名>（主工作树）`**，确保每个工作树路径都注册为工作区；**失效清扫**——auto 注册的、工作树已从 git 消失且无会话的文件夹会被自动注销（跟随 git）。20 秒静默轮询覆盖 agent 工具/CLI 在工作树层面的改动。同时它观察侧边栏工作区树，按标签把行匹配到工作区并注入控件。A renderless sync mount (popovers render from it). Watches the workspace list, queries `/dsh-git-worktree/list` per workspace: ensures the repo-root (main worktree) workspace exists and is marked **`<project>（主工作树）`**, ensures every worktree path is registered as a workspace; **stale sweep** — auto-registered folders whose worktree disappeared from git and hold no sessions are unregistered again (the tree follows git). A 20s quiet poll covers worktree-level changes made by agent tools/CLI. The same mount observes the sidebar tree, matches rows to workspaces by label, and injects the controls.
+- **行级控件（DOM 注入 / injected per row）** —
+  - 主文件夹（仓库主工作树）＋ → 「新增工作树」小窗：功能名 → **创建绑定会话** 或 **仅创建工作树**；注入期间其原生「新建会话」＋ 被隐藏，卸载时恢复。Primary-worktree (repo) folder ＋ → "add worktree" popover (create bound conversation / worktree only); the stock new-session ＋ is hidden while injected and restored on unmount.
+  - 工作树文件夹 → 保留原生 ＋（在该工作树新建会话，出生即绑定）+ **删除工作树** 按钮（确认框：绑定会话列表、可一并归档、删除 git 工作树并注销文件夹）。Worktree folder → keeps the stock ＋ (new conversation born bound) + **删除工作树 (Remove worktree)** button (confirm: bound conversations, optional archive, removes the worktree and unregisters the folder).
+  - 非仓库 / 仓库内的无关子目录 → 不注入任何控件，保持原生行为。Non-repo and unrelated nested folders → no control injected, stock behavior preserved.
+  - **同名工作区** → 行上出现「选择工作区」按钮，列出每个候选的绝对路径，由用户显式选择，**绝不猜测**。**Duplicate labels** → a "选择工作区" control lists each candidate's absolute path for an explicit choice — the plugin never silently targets a guessed repository.
 
 浏览器端通过 `ctx.webServer` 以同源方式调用 `/dsh-git-worktree` 前缀下的宿主路由（`list` / `status` / `branches` / `add` / `remove` / `bindings`）。读路由（`list` / `status`）对不在任何 git 仓库内的路径返回 `{ notARepo: true }`（200）；`bindings` 对每个输入路径逐条标记 `notARepo`/工作树归属；写操作与 agent 工具仍保持严格报错。按 dsh-host-webserver 的文档约定，这些路由**没有鉴权**——请保持默认的 loopback 绑定。
 
@@ -108,21 +109,15 @@ Sync is **coalesced**: at most one scan in flight, later requests folded into a 
 
 ## 工作区树中的工作树 / Worktrees in the workspace tree
 
-插件还注册到 `sidebar.workspaces.create`（工作区浏览器每行「+」的可替换链），并结合 `sidebar.footer.action` 的自动同步，让左侧工作区树成为**完整的绑定管理界面**：
+插件只注册到 `sidebar.footer.action`（自动同步 + DOM 行集成），让左侧工作区树成为**完整的绑定管理界面**。当前 `ui-workspace` 把每个工作区渲染为**平铺**的项目行（不再按路径嵌套），因此每条工作树是独立的一行，插件在该行上注入对应控件：
 
-- **树结构**：核心 `ui-workspace` 按目录包含关系把工作区嵌套渲染——`<repo>/.dsh-wt/<name>` 自动成为 `<repo>` 主文件夹下的副文件夹，其会话显示在副文件夹里。自动同步保证**每个工作树（包括从未打开过会话的）都注册成副文件夹**；主工作树的路径就是仓库根，因此项目文件夹即主工作树，标题标记为 **`<项目名>（主工作树）`**。
-- **⚠️ 工作树目录位置决定树形**：核心按**路径包含关系**嵌套渲染（工作区路径还是 realpath 规范化的），所以"显示在主工作树子目录下"的效果**只有工作树目录位于主仓库根之内**（`<repo>/.dsh-wt/<name>`）时才成立。若用 `git_worktree_add` 的显式 `path` 把工作树建在仓库**外面**（如同级目录 `<repo 的父目录>/<name>`），该工作树仍会被自动检测、注册并显示在侧边栏，但只能作为**独立的顶层文件夹**（会话绑定、分支显示、删除工作树等其余能力不受影响）——它**不会**嵌套在项目文件夹下。需要嵌套展示时，请把工作树放在 `<repo>/.dsh-wt/` 下。
-- **主文件夹 ＋（仓库）**：弹出「新增工作树」小窗，输入功能名 → **创建绑定会话**（创建 `.dsh-wt/<name>` 工作树并立即创建/打开绑定会话，一键）或 **仅创建工作树**；非 git 目录的文件夹自动回落为默认「新建会话」。
-- **副文件夹 ＋（工作树）**：保持核心默认行为——在该工作树新建会话（会话出生即绑定）。
-- **副文件夹 删除工作树**（仅已检测到的工作树）：确认框列出绑定的会话，勾选"一并归档这些会话"后删除 git 工作树并注销其文件夹；工作树从 git 消失（agent/CLI 删除）后，无会话的文件夹由同步自动清理。
+The plugin registers only into `sidebar.footer.action` (auto-sync + DOM row integration), making the sidebar tree the **complete binding-management surface**. Current `ui-workspace` renders each workspace as a **flat** project row (no path nesting), so every worktree is its own row and the plugin injects the matching controls on it:
 
-The plugin also registers into `sidebar.workspaces.create` (the replaceable per-row 「+」 chain of the workspace browser) and pairs it with the `sidebar.footer.action` auto-sync, making the sidebar tree the **complete binding-management surface**:
-
-- **Tree shape**: core `ui-workspace` nests workspaces by directory containment — `<repo>/.dsh-wt/<name>` renders as a subfolder under the `<repo>` main folder, with its conversations inside. The auto-sync guarantees **every worktree (even never-opened ones) is registered as a subfolder**; the main worktree's path IS the repo root, so the project folder is the main worktree, titled **`<project>（主工作树）`**.
-- **⚠️ Placement decides the tree shape**: the core nests by **path containment** (workspace paths are realpath-canonical), so the "shown under the main worktree" effect holds **only when the worktree directory lives inside the main repo root** (`<repo>/.dsh-wt/<name>`). A worktree created **outside** the repo (e.g. a sibling directory `<parent>/<name>`) via an explicit `git_worktree_add` `path` is still auto-detected, registered and shown in the sidebar — but as its own **top-level folder** (binding, branch display and remove-worktree all keep working); it does **not** nest under the project folder. For the nested display, place worktrees under `<repo>/.dsh-wt/`.
-- **Main folder ＋ (repo)**: opens a small "add worktree" popover — feature name → **创建绑定会话 (create bound conversation)** (creates `.dsh-wt/<name>` and immediately creates/opens the bound conversation, one click) or **仅创建工作树 (worktree only)**; non-git folders automatically fall back to the default new-session ＋.
-- **Subfolder ＋ (worktree)**: keeps the core default — a new conversation born bound to that worktree.
-- **Subfolder 删除工作树 (Remove worktree)** (detected worktrees only): the confirm lists bound conversations, checkbox to **archive them**, then removes the git worktree and unregisters the folder; worktrees removed on the git side (agent/CLI) are swept by the sync when their folder holds no sessions.
+- **树结构**：自动同步保证**每个工作树（包括从未打开过会话的）都注册为一个工作区行**；主工作树的路径就是仓库根，因此项目文件夹即主工作树，标题标记为 **`<项目名>（主工作树）`**。**Tree shape**: the auto-sync guarantees **every worktree (even never-opened ones) is registered as a workspace row**; the main worktree's path IS the repo root, so the project folder is the main worktree, titled **`<project>（主工作树）`**.
+- **工树目录位置**：无论工作树目录在仓库内（`<repo>/.dsh-wt/<name>`）还是仓库外（显式 `path`），当前核心都将其渲染为独立的项目行；插件的能力（会话绑定、分支显示、删除工作树）不受位置影响。**Placement**: whether the worktree lives inside the repo (`<repo>/.dsh-wt/<name>`) or outside it (explicit `path`), current core renders it as its own project row; every plugin capability (binding, branch display, remove-worktree) is unaffected by placement.
+- **行匹配与同名工作区**：行按标签匹配到工作区；标签重复时行上出现「选择工作区」，列出每个候选的绝对路径供显式选择，**绝不静默作用于猜测的仓库**。**Row matching**: rows match workspaces by label; on duplicate labels a "选择工作区" control lists each candidate's absolute path for an explicit choice — never a silent guess.
+- **主文件夹 ＋（仓库）**：弹出「新增工作树」小窗，输入功能名 → **创建绑定会话**（创建 `.dsh-wt/<name>` 工作树并立即创建/打开绑定会话，一键）或 **仅创建工作树**；非 git 目录不注入控件，保持默认「新建会话」。**Main folder ＋ (repo)**: opens a small "add worktree" popover — feature name → **创建绑定会话 (create bound conversation)** (creates `.dsh-wt/<name>` and immediately creates/opens the bound conversation, one click) or **仅创建工作树 (worktree only)**; non-git folders keep the default new-session ＋.
+- **工作树行 ＋ / 删除工作树**：保留核心默认 ＋（在该工作树新建会话，会话出生即绑定），并新增 **删除工作树**（仅已检测到的工作树）：确认框列出绑定的会话，勾选"一并归档这些会话"后删除 git 工作树并注销其文件夹；工作树从 git 消失（agent/CLI 删除）后，无会话的文件夹由同步自动清理。**Worktree row ＋ / Remove worktree**: keeps the core default ＋ (new conversation born bound) and adds **删除工作树 (Remove worktree)** (detected worktrees only): the confirm lists bound conversations, checkbox to **archive them**, then removes the git worktree and unregisters the folder; worktrees removed on the git side (agent/CLI) are swept by the sync when their folder holds no sessions.
 
 ## 配置 / Configuration
 
@@ -177,13 +172,15 @@ node test/routes-http.js # 真实 HTTP：方法校验（含 HEAD/OPTIONS）、�
                          # 严格 vs 宽容 notARepo、超时 abort
 node test/client-unit.js # 客户端纯函数：sanitizeName 边界（切片尾点、HEAD、代理对、check-ref-format 性质测试）、
                          # sessionsSame、api() 错误映射
-node test/client-dom.js  # jsdom 交互：自动同步（注册工作树/主工作树标记/失效清扫）、树链组件
-                         # （repo ＋ 新建工作树、工作树副文件夹 ＋/删除、非工作树回落、点击外部关闭）
+node test/client-smoke.js # 客户端 bundle 加载 + 当前服务接线（uiWorkspace.connectWorkspace/openSession）
+node test/client-current.js # 当前 DSH 兼容回归：只请求存在的 slot、服务接线、行 DOM 集成生命周期、同名选择
+node test/client-dom.js  # jsdom 交互：自动同步（注册工作树/主工作树标记/失效清扫）、行级 DOM 注入
+                         # （repo ＋ 新建工作树、工作树行 ＋/删除、非工作树回落、同名选择、卸载恢复）
 node test/flows.js       # 真实用户操作流：一键绑定会话、agent 准备/开发者打开、全生命周期、跨仓库、
                          # unborn 仓库首绑、双工作树同名竞态
 node test/schema-conformance.js # 工具输出 vs 声明 schema（harness 的 validateJsonSchemaValue 原样复放）：
                          # 9 工具全部输出必须通过 additionalProperties:false 校验——防止
-                         # 遗漏 absolutePath / 可空 branch 之类的 schema 漂移在真实会话里炸掉
+                         # 遗漏 absolutePath / 可空 branch / 可空 worktree 之类 schema 漂移在真实会话里炸掉
 ```
 
-`client-dom.js` 需要 jsdom（插件本身不依赖它）：从 DeepSeek Harness checkout 解析（`DSH_HARNESS` 指向其根目录，默认 `/Users/aq/deepseek-harness`），找不到时该套件自动跳过。`KEEP_SCRATCH=1` 可保留测试用临时仓库以便检查。
+`client-dom.js` 与 `client-current.js` 需要 jsdom（插件本身不依赖它）：从 DeepSeek Harness checkout 解析（`DSH_HARNESS` 指向其根目录，默认 `/Users/aq/deepseek-harness`），找不到时该套件自动跳过。`KEEP_SCRATCH=1` 可保留测试用临时仓库以便检查。

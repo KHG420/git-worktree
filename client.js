@@ -20,13 +20,19 @@
  *    Worktrees created or removed on the git side (agent tools, CLI) are
  *    picked up by a quiet poll; registrations for worktrees that disappeared
  *    (and carry no sessions) are unregistered again.
- * 2. **Per-row affordances** through the `sidebar.workspaces.create` chain:
- *    a repo folder's ＋ opens the "新增工作树" popover (worktree + workspace +
- *    bound session in one click, unchanged); a worktree subfolder row keeps
- *    the default new-session ＋ (the session is born inside that worktree,
- *    i.e. bound) and gains a 删除工作树 button whose anchored confirm lists
- *    the bound conversations, offers to archive them, removes the git
- *    worktree and unregisters its folder.
+ * 2. **Per-row affordances via DOM integration.** Current DSH's ui-workspace
+ *    no longer declares the `sidebar.workspaces.create` chain (only the
+ *    `sidebar.workspaces.directoryFlow` picker hole), so the controls are
+ *    installed directly into the live workspace tree that the footer mount
+ *    observes: a repo (primary worktree) folder row gains ＋ ("新增工作树",
+ *    worktree + workspace + bound session in one click) while its stock
+ *    new-session ＋ is hidden; a linked-worktree row keeps the stock ＋ and
+ *    gains 删除工作树 whose anchored confirm lists the bound conversations,
+ *    offers to archive them, removes the git worktree and unregisters its
+ *    folder. Rows are matched to workspaces by label; duplicate labels open an
+ *    explicit chooser (with each candidate's absolute path) instead of acting
+ *    on a guessed repository. The integration restores every stock control on
+ *    unmount.
  *
  * Plain DOM + injected CSS, no extra dependencies beyond react.
  */
@@ -69,6 +75,13 @@ window.__ModuleLoader__.load({
       ".gwt-createRow{display:flex;gap:8px;justify-content:flex-end}",
       ".gwt-confirmRow{display:flex;gap:8px;justify-content:flex-end}",
       ".gwt-boundList{color:var(--dsw-alias-label-secondary, #555);font-size:12px;line-height:18px;word-break:break-word}",
+      // Same-keyed workspace labels: the row control opens an explicit chooser
+      // instead of guessing a repository.
+      ".gwt-rowAmbiguous{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary, #888);cursor:pointer;padding:0}",
+      ".gwt-rowAmbiguous:hover{background:var(--dsw-alias-fill-l3, #e9eaed);color:var(--dsw-alias-label-secondary, #555)}",
+      ".gwt-chooseList{display:flex;flex-direction:column;gap:4px;max-height:220px;overflow:auto}",
+      ".gwt-chooseItem{display:flex;flex-direction:column;align-items:flex-start;gap:1px;text-align:left;width:100%}",
+      ".gwt-choosePath{font-family:var(--dsw-font-mono, monospace);font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary, #888);word-break:break-all}",
     ].join("\n");
     const tagId = "dsh-git-worktree/tree.css";
     if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId) + "]") === null) {
@@ -122,14 +135,13 @@ window.__ModuleLoader__.load({
     };
 
     /**
-     * Stop an event from leaving the popover container. The popover is a DOM
-     * child of the workspace-tree row (the `sidebar.workspaces.create` chain
-     * renders inside the row's action cell), and that row div carries
-     * `onClick={onToggle}` — so without this guard, a click on the popover's
-     * input, buttons, header or path text bubbles up to the row and toggles
-     * the group's expand/collapse. Pointer-down and mousedown are stopped too
-     * so a press inside the popover never feeds the row's other pointer
-     * behaviors (e.g. the HTML5 row drag that the core wires to the row).
+     * Stop an event from leaving the popover container. The popover renders
+     * from the footer mount, but its injected trigger button lives inside the
+     * workspace-tree row and that row div carries `onClick={onToggle}` — so
+     * without this guard a click on the popover's input, buttons, header or
+     * path text could still be mistaken for a row interaction. Pointer-down
+     * and mousedown are stopped too so a press inside the popover never feeds
+     * the row's other pointer behaviors (e.g. the HTML5 row drag).
      */
     const stopPopoverEvent = (event) => event.stopPropagation();
 
@@ -188,9 +200,9 @@ window.__ModuleLoader__.load({
     /**
      * Live git-side facts the row affordances read: absolute worktree path →
      * { branch, head, primary, repoRoot }, plus repoRoot → worktree paths.
-     * `WorktreeSync` republishes after every pass; `WorktreeCreateButton`
-     * subscribes via useSyncExternalStore to decide whether a nested row is a
-     * worktree (and thus gets the 删除工作树 affordance).
+     * `WorktreeSync` republishes after every pass; the DOM row integration
+     * reads the store to decide whether a row is a worktree (and thus gets the
+     * 删除工作树 affordance) and to resolve each row's repository.
      */
     const worktreeStore = {
       /** Immutable-per-publish snapshot: { byPath: Map, roots: Map } — replaced, never mutated. */
@@ -408,21 +420,49 @@ window.__ModuleLoader__.load({
       });
     }
 
-    // ── renderless sync mount ───────────────────────────────────────────────
+    // ── footer mount: worktree sync + DOM integration host ─────────────────
     /**
-     * Mounted into `sidebar.footer.action` (rendered in both sidebar widths);
-     * renders nothing. Watches the workspace list and keeps every project's
-     * worktrees registered as nested folders. A quiet poll covers git-side
-     * changes (agent tools, CLI) that never touch the workspace list.
-     *
-     * `debounceMs`/`intervalMs` are props so tests can shrink them.
+     * Mounted into `sidebar.footer.action` (rendered in both sidebar widths).
+     * Keeps every project's worktrees registered as workspace folders (quiet
+     * poll included) and hosts the per-row DOM integration + anchored
+     * popovers. Receives `useWorkspaces`/`useSessions` from the slot root
+     * hooks and `sync`/`openBoundSession`/`archiveSessions` from the
+     * registration inject face. `debounceMs`/`intervalMs`/`doc` are props so
+     * tests can shrink timings and inject their document.
      */
     const SYNC_DEBOUNCE_MS = 400;
     const SYNC_INTERVAL_MS = 20000;
-    function WorktreeSync({ useWorkspaces, sync, debounceMs = SYNC_DEBOUNCE_MS, intervalMs = SYNC_INTERVAL_MS }) {
+    /** Neutral fallback for SSR/unit renders without the sessions root hook. */
+    const emptySessions = (selector) => selector({ ids: [], byId: {}, current: undefined });
+
+    function WorktreeSync({ useWorkspaces, useSessions, sync, openBoundSession, archiveSessions, debounceMs = SYNC_DEBOUNCE_MS, intervalMs = SYNC_INTERVAL_MS, doc }) {
       const items = useWorkspaces((state) => state.items);
       const phase = useWorkspaces((state) => state.phase);
+      // Full conversation list (subagent children share their parent's cwd and
+      // are not bindings of their own); `sessionsSame` keeps the selection
+      // identity stable across session-store notifications.
+      const readSessions = typeof useSessions === "function" ? useSessions : emptySessions;
+      const allSessions = readSessions((snapshot) => snapshot.ids
+        .map((id) => snapshot.byId[id])
+        .filter((s) => s !== undefined && s.origin !== "subagent"),
+      sessionsSame);
+      const worktreeState = react.useSyncExternalStore(worktreeStore.subscribe, worktreeStore.getSnapshot, worktreeStore.getSnapshot);
+      const [popover, setPopover] = react.useState(null);
+      const targetDoc = doc ?? (typeof document !== "undefined" ? document : null);
 
+      // Latest-value ref: the observer never has to re-subscribe when props or
+      // workspace data change.
+      const latest = react.useRef({ items, sync, openBoundSession, archiveSessions, allSessions, setPopover });
+      react.useEffect(() => {
+        latest.current.items = items;
+        latest.current.sync = sync;
+        latest.current.openBoundSession = openBoundSession;
+        latest.current.archiveSessions = archiveSessions;
+        latest.current.allSessions = allSessions;
+        latest.current.setPopover = setPopover;
+      });
+
+      // Sync pass: keep every project's worktrees registered as workspace folders.
       react.useEffect(() => {
         if (phase !== "ready") return;
         const timer = window.setTimeout(() => {
@@ -441,116 +481,346 @@ window.__ModuleLoader__.load({
         };
       }, [items, phase, sync, debounceMs, intervalMs]);
 
-      return null;
+      // DOM integration: install once, rescan whenever the tree inputs move.
+      const integration = react.useRef(null);
+      react.useEffect(() => {
+        if (targetDoc === null) return;
+        const manager = createRowIntegration({
+          doc: targetDoc,
+          readItems: () => latest.current.items,
+          readWorktreeState: () => worktreeStore.state,
+          onAction: (action) => {
+            if (action.kind === "ambiguous") {
+              latest.current.setPopover({ kind: "choose", anchor: action.anchor, candidates: action.candidates });
+              return;
+            }
+            const candidate = action.candidates[0];
+            latest.current.setPopover({
+              kind: action.kind,
+              anchor: action.anchor,
+              target: {
+                workspaceId: candidate.workspace.workspaceId,
+                cwd: candidate.workspace.path,
+                label: candidate.workspace.title,
+                info: candidate.info,
+              },
+            });
+          },
+        });
+        integration.current = manager;
+        manager.start();
+        return () => {
+          manager.stop();
+          integration.current = null;
+        };
+      }, [targetDoc]);
+      react.useEffect(() => {
+        integration.current?.scan();
+      }, [items, worktreeState, phase]);
+
+      // Click-outside closes either popover.
+      react.useEffect(() => {
+        if (popover === null || targetDoc === null) return;
+        const ElementCtor = targetDoc.defaultView?.Element ?? Element;
+        const onPointerDown = (event) => {
+          const elem = event.target;
+          if (elem instanceof ElementCtor
+            && (elem.closest(".gwt-createPop") !== null
+              || elem.closest(".gwt-rowPlus") !== null
+              || elem.closest(".gwt-rowRemove") !== null
+              || elem.closest(".gwt-rowAmbiguous") !== null)) return;
+          setPopover(null);
+        };
+        targetDoc.addEventListener("pointerdown", onPointerDown);
+        return () => targetDoc.removeEventListener("pointerdown", onPointerDown);
+      }, [popover, targetDoc]);
+
+      if (popover === null) return null;
+      if (popover.kind === "create") {
+        return react_jsx_runtime.jsx(CreateWorktreePopover, {
+          target: popover.target,
+          anchor: popover.anchor,
+          openBoundSession,
+          onClose: () => setPopover(null),
+        });
+      }
+      if (popover.kind === "remove") {
+        // Retargeting the popover from one row to another must reset its
+        // per-target state (bound sessions, archive choice, load status) so a
+        // stale list can never be archived under the wrong path; the key
+        // remounts the component when the target changes.
+        return react_jsx_runtime.jsx(RemoveWorktreePopover, {
+          target: popover.target,
+          anchor: popover.anchor,
+          allSessions,
+          sync,
+          archiveSessions,
+          onClose: () => setPopover(null),
+        }, popover.target.workspaceId ?? popover.target.cwd);
+      }
+      return react_jsx_runtime.jsx(WorkspaceChooser, {
+        anchor: popover.anchor,
+        candidates: popover.candidates,
+        onPick: (candidate) => setPopover({
+          kind: candidate.info.primary ? "create" : "remove",
+          anchor: popover.anchor,
+          target: {
+            workspaceId: candidate.workspace.workspaceId,
+            cwd: candidate.workspace.path,
+            label: candidate.workspace.title,
+            info: candidate.info,
+          },
+        }),
+        onClose: () => setPopover(null),
+      });
     }
 
-    // ── workspace-tree row affordances ──────────────────────────────────────
-    /** Repo-ness probe for top-level rows, cached per path (as before). */
-    const repoKindCache = new Map(); // cwd -> 'repo' | 'not-repo'
-    const repoKind = (cwd) => {
-      if (repoKindCache.has(cwd)) return Promise.resolve(repoKindCache.get(cwd));
-      return listWorktrees(cwd)
-        .then((data) => {
-          const kind = data.notARepo ? "not-repo" : "repo";
-          repoKindCache.set(cwd, kind);
-          return kind;
-        })
-        .catch(() => {
-          repoKindCache.set(cwd, "not-repo");
-          return "not-repo";
-        });
+    // ── workspace-tree row affordances (DOM integration) ────────────────────
+    // Current DSH's ui-workspace browser no longer declares the
+    // `sidebar.workspaces.create` chain, so the per-row controls are installed
+    // straight into the live tree the footer mount (`sidebar.footer.action`,
+    // still a list slot) observes. The plugin owns two affordances:
+    //
+    //   • a primary-worktree (repo) folder row gets ＋ ("新增工作树") and its
+    //     stock new-session ＋ is hidden while the injection is live;
+    //   • a linked-worktree row keeps the stock new-session ＋ and gains
+    //     删除工作树.
+    //
+    // Rows are matched to workspaces by label. When several workspaces share a
+    // label the control opens an explicit chooser (each candidate's absolute
+    // path) instead of silently acting on a guessed repository. Every mutation
+    // is recorded on the row so a rescan is a no-op once the row is consistent,
+    // which keeps the MutationObserver from feeding back on itself.
+
+    const ROW_SELECTOR = '[role="treeitem"][aria-expanded]';
+    const TREE_SELECTOR = 'div[role="tree"]';
+    const CONTROL_ATTR = 'data-gwt-control';
+    const RESOLVED_ATTR = 'data-gwt-resolved';
+    const HIDDEN_ATTR = 'data-gwt-stock-hidden';
+
+    const PLUS_SVG = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M8 3v10M3 8h10"/></svg>';
+    const TRASH_SVG = '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 4.5h11"/><path d="M6 4.5V3.2A1.2 1.2 0 0 1 7.2 2h1.6A1.2 1.2 0 0 1 10 3.2v1.3"/><path d="M4 4.5l.6 8.2A1.2 1.2 0 0 0 5.8 14h4.4a1.2 1.2 0 0 0 1.2-1.3l.6-8.2"/><path d="M6.5 7.5v4M9.5 7.5v4"/></svg>';
+    const CHOOSE_SVG = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5 3.5 6 6 8.5"/><path d="M3.5 6h6.2A2.8 2.8 0 0 1 12.5 8.8v0"/><path d="M10 12.5 12.5 10 10 7.5"/><path d="M12.5 10H6.3A2.8 2.8 0 0 1 3.5 7.2v0"/></svg>';
+
+    /** The row's action cell: the direct span child that holds its buttons. */
+    const rowActionsOf = (row) => {
+      for (const child of row.children) {
+        if (child.tagName === "SPAN" && child.querySelector("button") !== null) return child;
+      }
+      return null;
     };
 
-    const PlusGlyph = () => react_jsx_runtime.jsx("svg", {
-      width: 16, height: 16, viewBox: "0 0 16 16", fill: "none",
-      stroke: "currentColor", strokeWidth: 1.5, strokeLinecap: "round",
-      "aria-hidden": true,
-      children: react_jsx_runtime.jsx("path", { d: "M8 3v10M3 8h10" }),
-    });
+    /** The row's label (`span.projectText > span.title`), or null when absent. */
+    const rowTitleOf = (row) => {
+      const title = row.querySelector("span > span");
+      if (title === null) return null;
+      const text = (title.textContent ?? "").trim();
+      return text === "" ? null : text;
+    };
 
-    const TrashGlyph = () => react_jsx_runtime.jsx("svg", {
-      width: 15, height: 15, viewBox: "0 0 16 16", fill: "none",
-      stroke: "currentColor", strokeWidth: 1.5, strokeLinecap: "round", strokeLinejoin: "round",
-      "aria-hidden": true,
-      children: [
-        react_jsx_runtime.jsx("path", { d: "M2.5 4.5h11" }),
-        react_jsx_runtime.jsx("path", { d: "M6 4.5V3.2A1.2 1.2 0 0 1 7.2 2h1.6A1.2 1.2 0 0 1 10 3.2v1.3" }),
-        react_jsx_runtime.jsx("path", { d: "M4 4.5l.6 8.2A1.2 1.2 0 0 0 5.8 14h4.4a1.2 1.2 0 0 0 1.2-1.3l.6-8.2" }),
-        react_jsx_runtime.jsx("path", { d: "M6.5 7.5v4M9.5 7.5v4" }),
-      ],
+    /** Trailing-separator-insensitive path key for workspace↔worktree joins. */
+    const normalizePathKey = (path) => (typeof path === "string" ? path.replace(/[/\\]+$/, "") : path);
+
+    /**
+     * Resolve one project row to the workspaces it can address.
+     * `candidates` keeps every workspace whose label equals the row's; `info`
+     * is its git worktree fact (null when the path is not a detected worktree).
+     * @returns `null` (leave the stock controls alone) or
+     *   `{ kind: 'create'|'remove'|'ambiguous', candidates }`.
+     */
+    const resolveRow = (row, items, byPath) => {
+      const title = rowTitleOf(row);
+      if (title === null) return null;
+      const matching = items.filter((workspace) => workspace.title === title);
+      if (matching.length === 0) return null;
+      const candidates = matching.map((workspace) => {
+        const path = normalizePathKey(workspace.path);
+        const info = byPath.get(path) ?? byPath.get(workspace.path) ?? null;
+        return { workspace, info };
+      });
+      if (candidates.length > 1) {
+        // Never guess between same-label workspaces. Only surface the chooser
+        // when at least one candidate is a real worktree (otherwise the row has
+        // no repo affordance at all).
+        return candidates.every((candidate) => candidate.info === null)
+          ? null
+          : { kind: "ambiguous", candidates };
+      }
+      const only = candidates[0];
+      if (only.info === null) return null;
+      return { kind: only.info.primary ? "create" : "remove", candidates };
+    };
+
+    /** Remove every control the plugin owns on `row` and restore hidden stock buttons. */
+    const cleanupRow = (row) => {
+      for (const control of row.querySelectorAll("[" + CONTROL_ATTR + "]")) control.remove();
+      for (const hidden of row.querySelectorAll("[" + HIDDEN_ATTR + "]")) {
+        hidden.style.display = "";
+        hidden.removeAttribute(HIDDEN_ATTR);
+      }
+      row.removeAttribute(RESOLVED_ATTR);
+    };
+
+    const rowSignature = (resolution) => resolution.kind + "|" + resolution.candidates
+      .map((candidate) => candidate.workspace.workspaceId + ":" + (candidate.info === null ? "x" : candidate.info.primary ? "p" : "l"))
+      .join(",");
+
+    const makeControl = (doc, kind) => {
+      const button = doc.createElement("button");
+      button.type = "button";
+      button.className = kind === "remove" ? "gwt-rowRemove" : kind === "ambiguous" ? "gwt-rowAmbiguous" : "gwt-rowPlus";
+      button.setAttribute(CONTROL_ATTR, kind);
+      button.innerHTML = kind === "remove" ? TRASH_SVG : kind === "ambiguous" ? CHOOSE_SVG : PLUS_SVG;
+      const label = kind === "remove" ? "删除工作树" : kind === "ambiguous" ? "选择工作区" : "新增工作树";
+      button.setAttribute("aria-label", label);
+      button.title = kind === "ambiguous" ? "存在同名工作区 — 点击选择" : label;
+      return button;
+    };
+
+    /**
+     * Install (or repair) the plugin's control(s) on one project row.
+     * Idempotent: a consistent row performs no DOM write, so the observer that
+     * watches these mutations settles instead of looping.
+     * @returns true when the DOM changed.
+     */
+    const applyRow = (row, resolution, onAction) => {
+      const actions = rowActionsOf(row);
+      if (actions === null) { cleanupRow(row); return false; }
+      // Count native descendant buttons, excluding any control this plugin
+      // already appended to the same action cell: on a rescan after a previous
+      // resolution the plugin's own button would otherwise be counted (and
+      // later picked as "the last button"), so the stock new-session ＋ would
+      // never be hidden. The core Menu primitive wraps its ellipsis anchor in
+      // its own <span>, so a real workspace row's actions hold [span(menu
+      // anchor), button(new session)] while the ungrouped pseudo-row holds only
+      // the bare new-session button. The new-session ＋ is the LAST native
+      // button in document order either way.
+      const nativeButtons = actions.querySelectorAll("button:not([" + CONTROL_ATTR + "])");
+      if (nativeButtons.length < 2) { cleanupRow(row); return false; }
+      if (resolution === null) { cleanupRow(row); return false; }
+      const signature = rowSignature(resolution);
+      const controls = row.querySelectorAll("[" + CONTROL_ATTR + "]");
+      if (row.getAttribute(RESOLVED_ATTR) === signature
+        && controls.length === 1
+        && controls[0].getAttribute(CONTROL_ATTR) === resolution.kind
+        && (resolution.kind !== "create" || actions.querySelector("[" + HIDDEN_ATTR + "]") !== null)) {
+        return false;
+      }
+      cleanupRow(row);
+      const button = makeControl(row.ownerDocument, resolution.kind);
+      const stop = (event) => event.stopPropagation();
+      button.addEventListener("pointerdown", stop);
+      button.addEventListener("mousedown", stop);
+      button.addEventListener("click", (event) => {
+        event.stopPropagation();
+        const rect = button.getBoundingClientRect();
+        onAction({
+          kind: resolution.kind,
+          candidates: resolution.candidates,
+          anchor: { left: rect.right + 8, top: rect.top },
+        });
+      });
+      actions.appendChild(button);
+      if (resolution.kind === "create") {
+        const plus = nativeButtons[nativeButtons.length - 1];
+        plus.style.display = "none";
+        plus.setAttribute(HIDDEN_ATTR, "1");
+      }
+      row.setAttribute(RESOLVED_ATTR, signature);
+      return true;
+    };
+
+    /**
+     * Live DOM integration installed by the footer mount. Observes the
+     * workspace tree, keeps the plugin's controls in sync with the workspace
+     * list + git facts, and reports user actions through `onAction`.
+     * `start()` performs the first scan; `stop()` disconnects the observer and
+     * restores every stock control it hid.
+     */
+    const createRowIntegration = ({ doc, readItems, readWorktreeState, onAction }) => {
+      let observer = null;
+      let scheduled = false;
+      let stopped = false;
+      const scan = () => {
+        if (stopped) return;
+        const items = readItems() ?? [];
+        const byPath = readWorktreeState()?.byPath ?? new Map();
+        for (const tree of doc.querySelectorAll(TREE_SELECTOR)) {
+          for (const row of tree.querySelectorAll(ROW_SELECTOR)) {
+            applyRow(row, resolveRow(row, items, byPath), onAction);
+          }
+        }
+      };
+      const schedule = () => {
+        if (stopped || scheduled) return;
+        scheduled = true;
+        Promise.resolve().then(() => {
+          scheduled = false;
+          scan();
+        });
+      };
+      /**
+       * Only workspace-tree mutations matter. Filtering here keeps unrelated
+       * churn (conversation streaming, hover cards) from scheduling repeated
+       * scans, while still catching a tree being (re)created.
+       */
+      const relevant = (mutation) => {
+        const target = mutation.target;
+        const element = target.nodeType === 1 ? target : target.parentElement;
+        if (element !== null && element !== undefined
+          && (element.matches(TREE_SELECTOR) || element.closest(TREE_SELECTOR) !== null)) return true;
+        for (const node of mutation.addedNodes) {
+          if (node.nodeType !== 1) continue;
+          if (node.matches(TREE_SELECTOR) || node.closest(TREE_SELECTOR) !== null
+            || node.querySelector(TREE_SELECTOR) !== null) return true;
+        }
+        return false;
+      };
+      return {
+        scan,
+        start() {
+          scan();
+          if (doc.body === null) return;
+          observer = new doc.defaultView.MutationObserver((mutations) => {
+            for (const mutation of mutations) if (relevant(mutation)) { schedule(); return; }
+          });
+          observer.observe(doc.body, { childList: true, subtree: true, characterData: true });
+        },
+        stop() {
+          stopped = true;
+          if (observer !== null) observer.disconnect();
+          observer = null;
+          for (const row of doc.querySelectorAll("[" + RESOLVED_ATTR + "]")) cleanupRow(row);
+        },
+      };
+    };
+
+    // ── anchored popovers ───────────────────────────────────────────────────
+    /** Shared fixed-position popover chrome; row events never leak through it. */
+    const popoverProps = (anchor) => ({
+      className: "gwt-createPop",
+      style: { left: anchor.left, top: anchor.top },
+      onClick: stopPopoverEvent,
+      onPointerDown: stopPopoverEvent,
+      onMouseDown: stopPopoverEvent,
     });
 
     /**
-     * Chain component for `sidebar.workspaces.create`. Receives the owner
-     * share ({ group, defaultCreate }), the selector's `matched`, and the
-     * inject face.
-     *
-     * - Top-level repo folder: ＋ opens the "新增工作树" popover (create
-     *   worktree + bound conversation). Top-level non-repo: the default
-     *   new-session ＋.
-     * - Nested worktree folder: the default new-session ＋ (session born in
-     *   that worktree = bound) plus a 删除工作树 button whose confirm lists
-     *   bound conversations, optionally archives them, removes the git
-     *   worktree and unregisters its folder.
-     * - Nested non-worktree folder: only the default new-session ＋.
+     * "新增工作树": create the worktree (optionally opening the bound session
+     * rooted at it) and close. Replaces the removed slot's create chain.
      */
-    function WorktreeCreateButton({ group, defaultCreate, matched, useSessions, openBoundSession, archiveSessions, sync }) {
-      const cwd = matched.cwd;
-      const topLevel = matched.topLevel;
-      const [kind, setKind] = react.useState("unknown");
-      const [open, setOpen] = react.useState(false); // create popover
-      const [deleteOpen, setDeleteOpen] = react.useState(false); // delete confirm popover
-      const [anchor, setAnchor] = react.useState(null); // { left, top }
+    function CreateWorktreePopover({ target, anchor, openBoundSession, onClose }) {
       const [name, setName] = react.useState("");
       const [busy, setBusy] = react.useState(false);
       const [error, setError] = react.useState(null);
-      const [removing, setRemoving] = react.useState(null); // { sessions, archive }
-      const [removeError, setRemoveError] = react.useState(null);
 
-      // Full conversation list (subagent children share their parent's cwd and
-      // are not bindings of their own); `sessionsSame` keeps the selection
-      // identity stable across session-store notifications.
-      const allSessions = useSessions((snapshot) => snapshot.ids
-        .map((id) => snapshot.byId[id])
-        .filter((s) => s !== undefined && s.origin !== "subagent"),
-      sessionsSame);
-      const worktreeState = react.useSyncExternalStore(worktreeStore.subscribe, worktreeStore.getSnapshot, worktreeStore.getSnapshot);
-      const worktreeInfo = worktreeState.byPath.get(cwd) ?? null;
-
-      react.useEffect(() => {
-        if (!topLevel) return;
-        let cancelled = false;
-        repoKind(cwd).then((k) => {
-          if (cancelled) return;
-          setKind(k);
-        });
-        return () => { cancelled = true; };
-      }, [cwd, topLevel]);
-
-      // Click-outside closes either popover (same pattern as the old panel).
-      react.useEffect(() => {
-        if (!open && !deleteOpen) return;
-        const onPointerDown = (event) => {
-          const target = event.target;
-          if (target instanceof Element
-            && (target.closest(".gwt-createPop") !== null
-              || target.closest(".gwt-rowPlus") !== null
-              || target.closest(".gwt-rowRemove") !== null)) return;
-          setOpen(false);
-          setDeleteOpen(false);
-        };
-        document.addEventListener("pointerdown", onPointerDown);
-        return () => document.removeEventListener("pointerdown", onPointerDown);
-      }, [open, deleteOpen]);
-
-      /** One-click from a repo folder: create the worktree, register the workspace, open a bound session. */
       const doCreate = async (withSession) => {
         const base = sanitizeName(name);
         if (base === "" || busy) return;
         setBusy(true);
         setError(null);
         try {
-          const result = await post("add", { repo: cwd, name: base, unique: true });
+          const result = await post("add", { repo: target.cwd, name: base, unique: true });
           let opened = null;
           if (withSession && result.absolutePath !== undefined && result.absolutePath !== null && result.absolutePath !== "") {
             opened = await openBoundSession(result.absolutePath);
@@ -562,7 +832,7 @@ window.__ModuleLoader__.load({
             return;
           }
           setName("");
-          setOpen(false);
+          onClose();
         } catch (e) {
           setError(e instanceof Error ? e.message : String(e));
         } finally {
@@ -570,216 +840,214 @@ window.__ModuleLoader__.load({
         }
       };
 
-      // Bound sessions for the delete confirm, resolved from the live feed.
-      const beginRemove = async (event) => {
-        event.stopPropagation();
-        const rect = event.currentTarget.getBoundingClientRect();
-        setAnchor({ left: rect.right + 8, top: rect.top });
-        setDeleteOpen(true);
-        setRemoveError(null);
+      return react_jsx_runtime.jsxs("div", {
+        ...popoverProps(anchor),
+        children: [
+          react_jsx_runtime.jsxs("div", {
+            className: "gwt-head",
+            children: [
+              react_jsx_runtime.jsx("span", { children: "新增工作树：" + target.label }),
+              react_jsx_runtime.jsx("span", { className: "gwt-popPath", children: target.cwd }),
+            ],
+          }),
+          react_jsx_runtime.jsx("input", {
+            className: "gwt-createInput",
+            value: name,
+            placeholder: "feature name → .dsh-wt/<name>（自动打开绑定会话）",
+            onChange: (event) => setName(event.target.value),
+            onKeyDown: (event) => {
+              if (event.key === "Enter" && !busy && name.trim() !== "") void doCreate(true);
+              if (event.key === "Escape") onClose();
+            },
+            autoFocus: true,
+          }),
+          error !== null && react_jsx_runtime.jsx("p", { className: "gwt-error", children: error }),
+          react_jsx_runtime.jsxs("div", {
+            className: "gwt-createRow",
+            children: [
+              react_jsx_runtime.jsx("button", {
+                type: "button",
+                className: "gwt-btn",
+                disabled: busy || name.trim() === "",
+                onClick: () => void doCreate(false),
+                children: "仅创建工作树",
+              }),
+              react_jsx_runtime.jsx("button", {
+                type: "button",
+                className: "gwt-btn gwt-btnPrimary",
+                disabled: busy || name.trim() === "",
+                onClick: () => void doCreate(true),
+                children: busy ? "…" : "创建绑定会话",
+              }),
+            ],
+          }),
+        ],
+      });
+    }
+
+    /**
+     * "删除工作树？": lists the conversations bound to `target.cwd`, offers to
+     * archive them, removes the git worktree and unregisters its workspace.
+     */
+    function RemoveWorktreePopover({ target, anchor, allSessions, sync, archiveSessions, onClose }) {
+      const [removing, setRemoving] = react.useState({ sessions: [], archive: false });
+      const [bindingReady, setBindingReady] = react.useState(false);
+      const [busy, setBusy] = react.useState(false);
+      const [error, setError] = react.useState(null);
+
+      react.useEffect(() => {
+        let cancelled = false;
+        // A retarget (or a session-store change) invalidates the previous
+        // bound-session list: clear it and keep the confirm action disabled
+        // until the binding information for THIS target loads successfully.
         setRemoving({ sessions: [], archive: false });
-        try {
-          const cwds = [...new Set(allSessions.map((s) => s.cwd).filter(Boolean))];
-          const bd = await resolveBindings(cwds);
-          const bound = [];
-          for (const row of bd.bindings) {
-            if (row.worktree === null || row.worktree.path !== cwd) continue;
-            const session = allSessions.find((s) => s.cwd === row.path);
-            if (session === undefined) continue;
-            bound.push({ id: session.id, title: session.displayTitle, blank: session.blank });
+        setBindingReady(false);
+        setError(null);
+        const resolveBound = async () => {
+          try {
+            const cwds = [...new Set(allSessions.map((s) => s.cwd).filter(Boolean))];
+            const data = await resolveBindings(cwds);
+            const bound = [];
+            for (const row of data.bindings) {
+              if (row.worktree === null || row.worktree.path !== target.cwd) continue;
+              const session = allSessions.find((s) => s.cwd === row.path);
+              if (session === undefined) continue;
+              bound.push({ id: session.id, title: session.displayTitle, blank: session.blank });
+            }
+            bound.sort((a, b) => (a.blank ? 1 : 0) - (b.blank ? 1 : 0) || a.title.localeCompare(b.title));
+            if (!cancelled) {
+              setRemoving({ sessions: bound, archive: bound.length > 0 });
+              setBindingReady(true);
+            }
+          } catch (e) {
+            if (!cancelled) setError(e instanceof Error ? e.message : String(e));
           }
-          bound.sort((a, b) => (a.blank ? 1 : 0) - (b.blank ? 1 : 0) || a.title.localeCompare(b.title));
-          setRemoving({ sessions: bound, archive: bound.length > 0 });
-        } catch (e) {
-          setRemoveError(e instanceof Error ? e.message : String(e));
-        }
-      };
+        };
+        void resolveBound();
+        return () => { cancelled = true; };
+      }, [target.cwd, allSessions]);
 
       const confirmRemove = async () => {
-        if (removing === null || busy) return;
-        if (worktreeInfo === null) {
-          setRemoveError("该文件夹不是已检测到的工作树");
+        if (busy || !bindingReady) return;
+        if (target.info === null) {
+          setError("该文件夹不是已检测到的工作树");
           return;
         }
         setBusy(true);
-        setRemoveError(null);
+        setError(null);
         try {
           if (removing.archive && removing.sessions.length > 0) {
             await archiveSessions(removing.sessions.map((s) => s.id));
           }
-          await post("remove", { repo: worktreeInfo.repoRoot, path: cwd });
-          if (matched.workspaceId !== undefined) {
+          await post("remove", { repo: target.info.repoRoot, path: target.cwd });
+          if (target.workspaceId !== undefined) {
             try {
-              await sync.delete(matched.workspaceId);
+              await sync.delete(target.workspaceId);
             } catch {
               /* registration already gone — fine */
             }
           }
-          setDeleteOpen(false);
-          setRemoving(null);
+          onClose();
         } catch (e) {
-          setRemoveError(e instanceof Error ? e.message : String(e));
+          setError(e instanceof Error ? e.message : String(e));
         } finally {
           setBusy(false);
         }
       };
 
-      // Nested rows: default new-session ＋ (+ 删除工作树 for detected
-      // non-primary worktrees).
-      if (!topLevel) {
-        return react_jsx_runtime.jsxs(react_jsx_runtime.Fragment, {
-          children: [
-            react_jsx_runtime.jsx("button", {
-              type: "button",
-              className: "gwt-rowPlus",
-              "aria-label": "新建会话",
-              title: "在该工作区新建会话",
-              onClick: (event) => {
-                event.stopPropagation();
-                defaultCreate();
-              },
-              children: react_jsx_runtime.jsx(PlusGlyph, {}),
-            }),
-            worktreeInfo !== null && !worktreeInfo.primary && react_jsx_runtime.jsx("button", {
-              type: "button",
-              className: "gwt-rowRemove",
-              "aria-label": "删除工作树",
-              title: "删除工作树",
-              onClick: (event) => void beginRemove(event),
-              children: react_jsx_runtime.jsx(TrashGlyph, {}),
-            }),
-            deleteOpen && anchor !== null && removing !== null && react_jsx_runtime.jsxs("div", {
-              className: "gwt-createPop",
-              style: { left: anchor.left, top: anchor.top },
-              onClick: stopPopoverEvent,
-              onPointerDown: stopPopoverEvent,
-              onMouseDown: stopPopoverEvent,
-              children: [
-                react_jsx_runtime.jsxs("div", {
-                  className: "gwt-head",
-                  children: [
-                    react_jsx_runtime.jsx("span", { children: "删除工作树？" }),
-                    react_jsx_runtime.jsx("span", { className: "gwt-popPath", children: cwd }),
-                  ],
-                }),
-                worktreeInfo !== null && react_jsx_runtime.jsx("span", {
-                  className: "gwt-popBranch",
-                  children: `${worktreeInfo.branch ?? "(detached)"} @ ${worktreeInfo.head ?? "?"}`,
-                }),
-                removing.sessions.length > 0 && react_jsx_runtime.jsx("span", {
-                  className: "gwt-boundList",
-                  children: `绑定会话（${removing.sessions.length}）：${removing.sessions.map((s) => s.title).join("、")}`,
-                }),
-                removing.sessions.length === 0 && react_jsx_runtime.jsx("span", {
-                  className: "gwt-note",
-                  children: "无绑定会话；删除后文件夹从树中移除。",
-                }),
-                react_jsx_runtime.jsxs("label", {
-                  className: "gwt-check",
-                  children: [
-                    react_jsx_runtime.jsx("input", {
-                      type: "checkbox",
-                      checked: removing.archive,
-                      disabled: removing.sessions.length === 0,
-                      onChange: (event) => setRemoving({ ...removing, archive: event.target.checked }),
-                    }),
-                    "一并归档这些会话（日志保留，侧边栏隐藏）",
-                  ],
-                }),
-                removeError !== null && react_jsx_runtime.jsx("p", { className: "gwt-error", children: removeError }),
-                react_jsx_runtime.jsxs("div", {
-                  className: "gwt-confirmRow",
-                  children: [
-                    react_jsx_runtime.jsx("button", {
-                      type: "button",
-                      className: "gwt-btn",
-                      disabled: busy,
-                      onClick: () => setDeleteOpen(false),
-                      children: "取消",
-                    }),
-                    react_jsx_runtime.jsx("button", {
-                      type: "button",
-                      className: "gwt-btn gwt-btnDanger",
-                      disabled: busy,
-                      onClick: () => void confirmRemove(),
-                      children: busy ? "…" : "确认删除",
-                    }),
-                  ],
-                }),
-              ],
-            }),
-          ],
-        });
-      }
-
-      // Top-level rows: repo folder ＋ opens the worktree create popover;
-      // non-repo folders keep the default new-session behavior.
-      const onTriggerClick = (event) => {
-        event.stopPropagation();
-        if (kind === "not-repo") {
-          defaultCreate();
-          return;
-        }
-        const rect = event.currentTarget.getBoundingClientRect();
-        setAnchor({ left: rect.right + 8, top: rect.top });
-        setOpen((value) => !value);
-      };
-
-      const title = kind === "not-repo" ? `在“${matched.label}”中新建会话` : "新增工作树";
-      return react_jsx_runtime.jsxs(react_jsx_runtime.Fragment, {
+      return react_jsx_runtime.jsxs("div", {
+        ...popoverProps(anchor),
         children: [
-          react_jsx_runtime.jsx("button", {
-            type: "button",
-            className: "gwt-rowPlus",
-            "aria-label": title,
-            title,
-            onClick: onTriggerClick,
-            children: react_jsx_runtime.jsx(PlusGlyph, {}),
-          }),
-          open && anchor !== null && react_jsx_runtime.jsxs("div", {
-            className: "gwt-createPop",
-            style: { left: anchor.left, top: anchor.top },
-            onClick: stopPopoverEvent,
-            onPointerDown: stopPopoverEvent,
-            onMouseDown: stopPopoverEvent,
+          react_jsx_runtime.jsxs("div", {
+            className: "gwt-head",
             children: [
-              react_jsx_runtime.jsxs("div", {
-                className: "gwt-head",
-                children: [
-                  react_jsx_runtime.jsx("span", { children: `新增工作树：${matched.label}` }),
-                  react_jsx_runtime.jsx("span", { className: "gwt-popPath", children: cwd }),
-                ],
-              }),
+              react_jsx_runtime.jsx("span", { children: "删除工作树？" }),
+              react_jsx_runtime.jsx("span", { className: "gwt-popPath", children: target.cwd }),
+            ],
+          }),
+          target.info !== null && react_jsx_runtime.jsx("span", {
+            className: "gwt-popBranch",
+            children: (target.info.branch ?? "(detached)") + " @ " + (target.info.head ?? "?"),
+          }),
+          removing.sessions.length > 0 && react_jsx_runtime.jsx("span", {
+            className: "gwt-boundList",
+            children: "绑定会话（" + removing.sessions.length + "）：" + removing.sessions.map((s) => s.title).join("、"),
+          }),
+          removing.sessions.length === 0 && react_jsx_runtime.jsx("span", {
+            className: "gwt-note",
+            children: "无绑定会话；删除后文件夹从树中移除。",
+          }),
+          react_jsx_runtime.jsxs("label", {
+            className: "gwt-check",
+            children: [
               react_jsx_runtime.jsx("input", {
-                className: "gwt-createInput",
-                value: name,
-                placeholder: "feature name → .dsh-wt/<name>（自动打开绑定会话）",
-                onChange: (event) => setName(event.target.value),
-                onKeyDown: (event) => {
-                  if (event.key === "Enter" && !busy && name.trim() !== "") void doCreate(true);
-                  if (event.key === "Escape") setOpen(false);
-                },
-                autoFocus: true,
+                type: "checkbox",
+                checked: removing.archive,
+                disabled: !bindingReady || removing.sessions.length === 0,
+                onChange: (event) => setRemoving({ ...removing, archive: event.target.checked }),
               }),
-              error !== null && react_jsx_runtime.jsx("p", { className: "gwt-error", children: error }),
-              react_jsx_runtime.jsxs("div", {
-                className: "gwt-createRow",
-                children: [
-                  react_jsx_runtime.jsx("button", {
-                    type: "button",
-                    className: "gwt-btn",
-                    disabled: busy || name.trim() === "",
-                    onClick: () => void doCreate(false),
-                    children: "仅创建工作树",
-                  }),
-                  react_jsx_runtime.jsx("button", {
-                    type: "button",
-                    className: "gwt-btn gwt-btnPrimary",
-                    disabled: busy || name.trim() === "",
-                    onClick: () => void doCreate(true),
-                    children: busy ? "…" : "创建绑定会话",
-                  }),
-                ],
+              "一并归档这些会话（日志保留，侧边栏隐藏）",
+            ],
+          }),
+          error !== null && react_jsx_runtime.jsx("p", { className: "gwt-error", children: error }),
+          react_jsx_runtime.jsxs("div", {
+            className: "gwt-confirmRow",
+            children: [
+              react_jsx_runtime.jsx("button", {
+                type: "button",
+                className: "gwt-btn",
+                disabled: busy,
+                onClick: onClose,
+                children: "取消",
+              }),
+              react_jsx_runtime.jsx("button", {
+                type: "button",
+                className: "gwt-btn gwt-btnDanger",
+                disabled: busy || !bindingReady,
+                onClick: () => void confirmRemove(),
+                children: busy ? "…" : "确认删除",
+              }),
+            ],
+          }),
+        ],
+      });
+    }
+
+    /** Explicit repository picker for same-label rows (never guess silently). */
+    function WorkspaceChooser({ anchor, candidates, onPick, onClose }) {
+      return react_jsx_runtime.jsxs("div", {
+        ...popoverProps(anchor),
+        children: [
+          react_jsx_runtime.jsxs("div", {
+            className: "gwt-head",
+            children: [
+              react_jsx_runtime.jsx("span", { children: "选择工作区" }),
+              react_jsx_runtime.jsx("span", { className: "gwt-note", children: "存在同名工作区 — 请选择要操作的项目" }),
+            ],
+          }),
+          react_jsx_runtime.jsx("div", {
+            className: "gwt-chooseList",
+            children: candidates.map((candidate, index) => react_jsx_runtime.jsxs("button", {
+              type: "button",
+              className: "gwt-btn gwt-chooseItem",
+              disabled: candidate.info === null,
+              onClick: () => { if (candidate.info !== null) onPick(candidate); },
+              children: [
+                react_jsx_runtime.jsx("span", {
+                  children: candidate.info === null ? candidate.workspace.title + "（非工作树）" : candidate.workspace.title,
+                }),
+                react_jsx_runtime.jsx("span", { className: "gwt-choosePath", children: candidate.workspace.path }),
+              ],
+            }, candidate.workspace.workspaceId + ":" + index)),
+          }),
+          react_jsx_runtime.jsxs("div", {
+            className: "gwt-confirmRow",
+            children: [
+              react_jsx_runtime.jsx("button", {
+                type: "button",
+                className: "gwt-btn",
+                onClick: onClose,
+                children: "取消",
               }),
             ],
           }),
@@ -788,21 +1056,23 @@ window.__ModuleLoader__.load({
     }
 
     // ── client plugin body ──────────────────────────────────────────────────
-    const inject = ["sessions", "workspaces", "slots"];
+    const inject = ["sessions", "workspaces", "uiWorkspace", "slots"];
 
     function apply(ctx) {
       const workspaces = ctx.get("workspaces");
-      const sessions = ctx.get("sessions");
+      const uiWorkspace = ctx.get("uiWorkspace");
       /**
        * Register the worktree path as a workspace and open a new session
-       * rooted there — the conversation is born bound to that worktree.
+       * rooted there — the conversation is born bound to that worktree. The
+       * UI workspace service owns the connect/open flow in current DSH
+       * (`workspaces` only exposes the bare snapshot + commands).
        * @returns {{ ok: boolean, sessionId?: string, message?: string }}
        */
       const openBoundSession = async (path) => {
         try {
           const workspace = await workspaces.create({ path });
-          const sessionId = await workspaces.connectWorkspace(workspace.workspaceId);
-          sessions.open(sessionId);
+          const sessionId = await uiWorkspace.connectWorkspace(workspace.workspaceId);
+          uiWorkspace.openSession(sessionId);
           return { ok: true, sessionId };
         } catch (e) {
           return { ok: false, message: e instanceof Error ? e.message : String(e) };
@@ -810,7 +1080,7 @@ window.__ModuleLoader__.load({
       };
       /** Archive (hide) sessions; their logs stay intact. */
       const archiveSessions = async (ids) => {
-        for (const id of ids) await workspaces.archiveSession(id);
+        for (const id of ids) await uiWorkspace.archiveSession(id);
       };
       /** The sync face: git listing + workspace runtime actions. */
       const sync = {
@@ -820,41 +1090,23 @@ window.__ModuleLoader__.load({
         delete: (id) => workspaces.delete(id),
       };
 
-      // Renderless auto-detect mount: keeps every project's worktrees
-      // registered as nested workspace folders (the left tree's single
-      // surface). Renders nothing in the footer.
+      // The footer mount keeps every project's worktrees registered as
+      // workspace folders and hosts the DOM integration that installs the
+      // per-row create/remove controls into the live tree. Current DSH's
+      // ui-workspace declares no `sidebar.workspaces.create` chain, so there
+      // is deliberately no chain registration here.
       ctx.slots.inject("sidebar.footer.action", () => ctx.slots.register({
         name: "sidebar.footer.action",
         id: "git-worktree-sync",
-        inject: () => ({ sync }),
+        inject: () => ({ sync, openBoundSession, archiveSessions }),
       }, WorktreeSync));
-
-      // The workspace-tree create chain: a repo folder's ＋ becomes
-      // "新增工作树" (create worktree + bound conversation in one click);
-      // worktree subfolder rows keep the new-session ＋ and gain
-      // 删除工作树; non-worktree rows keep the default ＋.
-      ctx.slots.inject("sidebar.workspaces.create", () => ctx.slots.register({
-        name: "sidebar.workspaces.create",
-        registrant: "git-worktree",
-        inject: () => ({ openBoundSession, archiveSessions, sync }),
-        select: (owner) => {
-          const g = owner.group;
-          if (g.workspaceId === undefined) return null;
-          return {
-            workspaceId: g.workspaceId,
-            cwd: g.cwd ?? "",
-            label: g.label,
-            topLevel: g.parentWorkspaceId === undefined,
-          };
-        },
-      }, WorktreeCreateButton));
     }
 
     exports.apply = apply;
     exports.inject = inject;
     // Test-only surface for the standalone client tests (test/client-unit.js,
-    // test/client-dom.js): the pure helpers + the sync engine. Not part of the
-    // public API.
+    // test/client-dom.js, test/client-current.js): the pure helpers, the sync
+    // engine, and the row-integration primitives. Not part of the public API.
     exports._test = {
       sanitizeName,
       sessionsSame,
@@ -863,6 +1115,10 @@ window.__ModuleLoader__.load({
       worktreeStore,
       loadAuto,
       saveAuto,
+      rowActionsOf,
+      rowTitleOf,
+      resolveRow,
+      createRowIntegration,
       _reset() {
         worktreeStore.state = { byPath: new Map(), roots: new Map() };
         worktreeStore.version = 0;

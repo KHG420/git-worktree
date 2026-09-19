@@ -17,10 +17,38 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
+import { pathToFileURL } from 'node:url'
+
+// Prefer the validator shipped by the *running* DSH install (0.1.5-rc.2): the
+// acceptance criterion is that the outputs pass the REAL dsh-tools validator,
+// and the plugin's own dependency can lag behind. Fall back to the resolvable
+// package, then to the local dependency.
+const runtimeValidatorCandidates = [
+  process.env.DSH_TOOLS,
+  '/Users/aq/.npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js',
+]
+let validateJsonSchemaValue
+let validatorSource = '@deepseek-ai/dsh-tools (local dependency)'
+for (const candidate of runtimeValidatorCandidates) {
+  if (!candidate || !existsSync(candidate)) continue
+  try {
+    const mod = await import(pathToFileURL(candidate).href)
+    if (typeof mod.validateJsonSchemaValue === 'function') {
+      validateJsonSchemaValue = mod.validateJsonSchemaValue
+      validatorSource = candidate
+      break
+    }
+  } catch {
+    /* candidate present but not importable — fall through to the local dependency */
+  }
+}
+if (validateJsonSchemaValue === undefined) {
+  ({ validateJsonSchemaValue } = await import('@deepseek-ai/dsh-tools'))
+}
+console.log(`schema validator: ${validatorSource}`)
 
 // ── fake subprocess seam (mirrors the surface tools use) ──────────────────
 function makeSubprocess() {
@@ -97,6 +125,21 @@ try {
   // accept every field, including the worktree/peer absolutePath.
   const binding = await tools.git_session_binding.execute({}, exec)
   check('git_session_binding', tools.git_session_binding.output.schema, binding)
+  assert.equal(binding.bound, false, 'primary-worktree session is unbound')
+  assert.equal(binding.worktree.primary, true, 'the primary worktree is reported as primary')
+
+  // git_session_binding (non-repo): `repo` and `worktree` are null — the first
+  // declared worktree path must accept null.
+  const nonRepoBase = mkdtempSync(join(tmpdir(), 'dsh-gw-nonrepo-'))
+  try {
+    const nonRepoBinding = await tools.git_session_binding.execute({}, execAt(nonRepoBase))
+    assert.equal(nonRepoBinding.notARepo, true, 'non-repo dir reports notARepo')
+    assert.equal(nonRepoBinding.repo, null, 'non-repo binding reports repo null')
+    assert.equal(nonRepoBinding.worktree, null, 'non-repo binding reports worktree null')
+    check('git_session_binding (nonrepo)', tools.git_session_binding.output.schema, nonRepoBinding)
+  } finally {
+    rmSync(nonRepoBase, { recursive: true, force: true })
+  }
 
   // git_repo_status: clean repo, no binding attached; then with a worktree
   // present so the binding block (incl. absolutePath) is exercised.
@@ -111,6 +154,17 @@ try {
   assert.ok(wtPath.includes('.dsh-wt'), 'worktree placed under .dsh-wt')
   assertions += 1
 
+  // git_repo_status from INSIDE the linked worktree: the binding attaches and
+  // reports bound:true (repo status in a linked session must work).
+  const linkedExec = execAt(added.absolutePath)
+  const linkedStatus = await tools.git_repo_status.execute({ repo: added.absolutePath }, linkedExec)
+  check('git_repo_status (linked worktree)', tools.git_repo_status.output.schema, linkedStatus)
+  assert.equal(linkedStatus.binding.bound, true, 'linked-worktree session is bound')
+  assert.equal(linkedStatus.binding.worktree.primary, false, 'linked worktree is not primary')
+  const linkedBinding = await tools.git_session_binding.execute({}, linkedExec)
+  check('git_session_binding (linked)', tools.git_session_binding.output.schema, linkedBinding)
+  assert.equal(linkedBinding.bound, true, 'linked session binding is bound')
+
   // git_worktree_add (detached): the row reports branch: null — the schema
   // must accept it (git_session_binding / git_repo_status binding blocks and
   // git_worktree_list share this shape).
@@ -119,6 +173,12 @@ try {
   assert.equal(addedDetached.branch, null, 'detached worktree reports branch null')
   const detachedPath = addedDetached.path
   assertions += 1
+  // A session bound to the DETACHED worktree reports branch:null through the
+  // binding schema too (nullable branch inside the nullable worktree object).
+  const detachedBinding = await tools.git_session_binding.execute({}, execAt(addedDetached.absolutePath))
+  check('git_session_binding (detached)', tools.git_session_binding.output.schema, detachedBinding)
+  assert.equal(detachedBinding.bound, true, 'detached worktree session is still bound')
+  assert.equal(detachedBinding.worktree.branch, null, 'detached binding reports branch null')
 
   // git_worktree_list: THE regression — the operation returns
   // worktrees[].absolutePath, which the declared schema must declare; the
@@ -140,6 +200,42 @@ try {
   // carry absolutePath too).
   const statusBound = await tools.git_repo_status.execute({}, exec)
   check('git_repo_status (bound)', tools.git_repo_status.output.schema, statusBound)
+
+  // The SECOND declared worktree path: git_repo_status.binding.worktree must
+  // accept null too (the operation's no-match branch returns null there). A
+  // real no-match is rare, so validate the declared path directly.
+  check('git_repo_status binding worktree null', tools.git_repo_status.output.schema, {
+    ...statusBound,
+    binding: { ...statusBound.binding, worktree: null },
+  })
+
+  // Nullable widening must not weaken either object branch: an unknown key or
+  // a non-object worktree is still rejected at BOTH declared paths.
+  const goodWorktree = {
+    path: '.', absolutePath: '/repo', branch: null, head: null,
+    detached: false, primary: true, current: true,
+  }
+  const sessionMalformed = {
+    bound: false, notARepo: false, repo: '/repo',
+    worktree: { ...goodWorktree, bogus: 1 },
+    peers: [],
+  }
+  const statusMalformed = {
+    bound: false, notARepo: false, repo: '/repo',
+    worktree: { ...goodWorktree, bogus: 1 },
+    peers: [],
+  }
+  for (const [label, schema, value] of [
+    ['git_session_binding', tools.git_session_binding.output.schema, sessionMalformed],
+    ['git_repo_status binding', tools.git_repo_status.output.schema.properties.binding, statusMalformed],
+  ]) {
+    const unknown = validateJsonSchemaValue(schema, value, 'value')
+    assert.ok(unknown.some((v) => v.includes('worktree')), `${label} must reject an unknown worktree key: ${unknown.join('; ')}`)
+    assertions += 1
+    const wrongType = validateJsonSchemaValue(schema, { ...value, worktree: 'nope' }, 'value')
+    assert.ok(wrongType.some((v) => v.includes('worktree')), `${label} must reject a non-object worktree: ${wrongType.join('; ')}`)
+    assertions += 1
+  }
 
   // git_branch_list: local + all (remote-tracking rows, if any).
   const branches = await tools.git_branch_list.execute({}, exec)

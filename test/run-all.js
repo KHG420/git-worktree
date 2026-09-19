@@ -16,7 +16,9 @@ const suites = [
   'tools-edge.js',    // 9 tools × boundary matrix against real repos
   'routes-http.js',   // real-HTTP route surface (methods, bodies, caps, timeout)
   'client-unit.js',   // client pure helpers (sanitizeName, sessionsSame, api)
-  'client-dom.js',    // jsdom panel interaction tests
+  'client-smoke.js',  // client bundle load + current-service wiring
+  'client-current.js', // current-DSH slots/service/DOM-integration regressions
+  'client-dom.js',    // jsdom tree interaction tests
   'flows.js',         // real-user-operation flows (panel + agent sequences)
   'schema-conformance.js', // tool outputs vs declared schemas (harness validator)
 ]
