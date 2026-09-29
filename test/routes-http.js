@@ -10,7 +10,8 @@
  */
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { mkdirSync, realpathSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { bootPlugin, makeRepo, makeSubprocess, scratchRoot } from './helpers.js'
 
@@ -62,6 +63,15 @@ git(unborn, 'config', 'user.name', 'T')
 
 const nonRepo = join(root, 'nonrepo')
 mkdirSync(nonRepo, { recursive: true })
+
+// The routes without a `repo` param run against the server process cwd. The
+// plugin checkout is itself a git repo, but in a multi-worktree setup that
+// directory may be a LINKED worktree on a non-main branch — so the expected
+// branch is derived, not hardcoded.
+const serverCwdBranch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+  cwd: process.cwd(),
+  encoding: 'utf8',
+}).trim()
 
 // main plugin instance (normal caps)
 const plugin = await bootPlugin()
@@ -136,11 +146,13 @@ t('branches: strict on non-repo (read but not tolerant), all=1 parsing', async (
 })
 
 t('status: missing repo param falls back to the server cwd (a real repo)', async () => {
-  // The plugin checkout itself is a git repo (unborn main) — process.cwd().
+  // The plugin checkout itself is a git repo — process.cwd(). In an independent
+  // worktree it can be on a linked branch, so assert the ACTUAL branch.
   const r = await req(base, 'GET', '/dsh-git-worktree/status')
   assert.equal(r.status, 200)
   assert.ok(!r.json.data.notARepo)
-  assert.equal(r.json.data.branch, 'main')
+  assert.notEqual(serverCwdBranch, '', 'the server cwd is on a real named branch')
+  assert.equal(r.json.data.branch, serverCwdBranch)
 })
 
 t('status: empty repo param (?repo=) behaves like a missing param, not a 400', async () => {
@@ -150,7 +162,7 @@ t('status: empty repo param (?repo=) behaves like a missing param, not a 400', a
   assert.equal(r.status, 200)
   assert.equal(r.json.ok, true)
   assert.ok(!r.json.data.notARepo, 'empty repo param does not fail')
-  assert.equal(r.json.data.branch, 'main')
+  assert.equal(r.json.data.branch, serverCwdBranch)
 })
 
 t('status: repo param with a literal + is decoded as space (standard form-encoding)', async () => {
@@ -245,6 +257,20 @@ t('bindings: dedupe, per-row notARepo, subdir resolution, missing dirs', async (
   assert.equal(gone.notARepo, true)
   assert.equal(gone.worktree, null)
   await tools.git_worktree_remove.execute({ path: wt }, { agent: { session: { header: { cwd: repo } } }, signal: new AbortController().signal })
+})
+
+t('bindings: aliased raw inputs each get a host-resolved row with the same canonical worktree', async () => {
+  // macOS /var vs /private/var (or any fs symlink) must be resolved by the
+  // HOST, never by a browser-side prefix heuristic: each unique raw cwd keeps
+  // its own row, and both rows agree on the resolved worktree path.
+  const aliased = realpathSync(repo)
+  if (aliased === repo) return // no filesystem alias on this platform
+  const r = await req(base, 'POST', '/dsh-git-worktree/bindings', { paths: [repo, aliased] })
+  assert.equal(r.status, 200)
+  const rows = r.json.data.bindings
+  assert.equal(rows.length, 2, 'each unique raw input gets its own row')
+  assert.deepEqual(rows.map((b) => b.path).sort(), [repo, aliased].sort())
+  assert.equal(rows[0].worktree.path, rows[1].worktree.path, 'host-resolved canonical worktree paths match')
 })
 
 t('bindings: cap at 500 inputs, tolerate non-array and empty', async () => {

@@ -14,9 +14,13 @@
  *    (`WorktreeSync`, mounted via the `sidebar.footer.action` slot) watches
  *    the workspace list, queries `/dsh-git-worktree/list` for every
  *    workspace, and ensures each git repo's worktrees are registered as
- *    nested workspace folders — so the core tree renders them as subfolders
- *    under the project folder with sessions grouped by exact cwd. The main
- *    worktree IS the project folder; its title gains a `（主工作树）` marker.
+ *    workspace folders. Current DSH's `ui-workspace` renders each registered
+ *    workspace as a FLAT project row (no path nesting), so the main worktree
+ *    IS the project folder (its title gains a `（主工作树）` marker) and every
+ *    linked worktree is its own row; sessions group by exact cwd on that row.
+ *    The plugin marks uniquely resolved linked rows with their main repository
+ *    and visually indents them in the flat list. This is not a nested tree:
+ *    the host still owns row order and expansion.
  *    Worktrees created or removed on the git side (agent tools, CLI) are
  *    picked up by a quiet poll; registrations for worktrees that disappeared
  *    (and carry no sessions) are unregistered again.
@@ -29,7 +33,10 @@
  *    new-session ＋ is hidden; a linked-worktree row keeps the stock ＋ and
  *    gains 删除工作树 whose anchored confirm lists the bound conversations,
  *    offers to archive them, removes the git worktree and unregisters its
- *    folder. Rows are matched to workspaces by label; duplicate labels open an
+ *    folder. Removal happens git-first: the worktree is removed before any
+ *    archive, and a later archive/unregister failure keeps the popover open so
+ *    only the unfinished cleanup can be retried (never a second git removal).
+ *    Rows are matched to workspaces by label; duplicate labels open an
  *    explicit chooser (with each candidate's absolute path) instead of acting
  *    on a guessed repository. The integration restores every stock control on
  *    unmount.
@@ -56,7 +63,8 @@ window.__ModuleLoader__.load({
       ".gwt-rowRemove{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary, #888);cursor:pointer;padding:0}",
       ".gwt-rowRemove:hover{background:var(--dsw-alias-danger-soft, rgba(217,45,32,.1));color:var(--dsw-alias-danger-strong, #d92d20)}",
       // Anchored popover base (create + delete share it).
-      ".gwt-createPop{position:fixed;z-index:1001;width:300px;box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2, #e5e7eb);background:var(--dsw-specific-menu, #fff);box-shadow:var(--dsw-shadow-lv3, 0 8px 24px rgba(0,0,0,.12));border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:8px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary, #111)}",
+      ".gwt-createPop{position:fixed;z-index:1001;width:300px;box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2, #e5e7eb);background:var(--dsw-specific-menu, #fff);box-shadow:var(--dsw-shadow-lv3, 0 8px 24px rgba(0,0,0,.12));border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:8px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary, #111);max-height:calc(100vh - 16px);overflow-y:auto;overscroll-behavior:contain;outline:none}",
+      ".gwt-createPop button:focus-visible{outline:2px solid var(--dsw-alias-border-accent, #4f8cff);outline-offset:1px}",
       ".gwt-createPop .gwt-head{display:flex;flex-direction:column;gap:2px}",
       ".gwt-createPop .gwt-popPath{font-family:var(--dsw-font-mono, monospace);font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary, #888);word-break:break-all}",
       ".gwt-createPop .gwt-popBranch{font-family:var(--dsw-font-mono, monospace);font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary, #888)}",
@@ -71,6 +79,14 @@ window.__ModuleLoader__.load({
       ".gwt-note{color:var(--dsw-alias-label-tertiary, #888);font-size:12px;line-height:18px}",
       ".gwt-created{display:flex;flex-direction:column;gap:8px;border:1px solid var(--dsw-alias-border-ok, #12b76a);background:var(--dsw-alias-fill-ok-soft, rgba(18,183,106,.08));border-radius:10px;padding:8px 10px;font-size:12px;line-height:18px}",
       ".gwt-createdPath{font-family:var(--dsw-font-mono, monospace);word-break:break-all}",
+      ".gwt-field{display:flex;flex-direction:column;gap:4px}",
+      ".gwt-fieldLabel{color:var(--dsw-alias-label-secondary, #555);font-size:12px;line-height:18px;font-weight:500}",
+      ".gwt-fieldHint{color:var(--dsw-alias-label-tertiary, #888);font-size:11px;line-height:16px}",
+      ".gwt-fieldError{color:var(--dsw-alias-danger-strong, #d92d20);font-size:12px;line-height:18px;margin:0}",
+      ".gwt-preview{font-family:var(--dsw-font-mono, monospace);font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary, #555);word-break:break-all}",
+      ".gwt-details{color:var(--dsw-alias-label-tertiary, #888);font-size:11px;line-height:16px}",
+      ".gwt-details summary{cursor:pointer}",
+      ".gwt-rawError{display:block;margin-top:4px;font-family:var(--dsw-font-mono, monospace);color:var(--dsw-alias-label-secondary, #555);word-break:break-all;white-space:pre-wrap}",
       ".gwt-check{display:flex;gap:6px;align-items:center;font-size:12px;line-height:18px;cursor:pointer}",
       ".gwt-createRow{display:flex;gap:8px;justify-content:flex-end}",
       ".gwt-confirmRow{display:flex;gap:8px;justify-content:flex-end}",
@@ -151,11 +167,12 @@ window.__ModuleLoader__.load({
      * chars, space, ~ ^ : ? * [ \ .. //, a trailing .lock) plus path
      * separators and the '@' of a forbidden '@{' sequence, collapse runs of
      * '-' and trim leading/trailing separators. Non-ASCII names (e.g. Chinese)
-     * are legal git refs and are preserved. The final result is guaranteed to
-     * pass `git check-ref-format refs/heads/<name>`.
+     * are legal git refs and are preserved. This is the raw draft BEFORE the
+     * degenerate fallback, so the UI can tell an invalid input (no legal
+     * content) from a legal one; may be empty.
      */
-    const sanitizeName = (raw) => {
-      const s = raw.trim()
+    const sanitizeDraft = (raw) => {
+      const s = String(raw).trim()
         .replace(/[\u0000-\u001f\u007f ~^:?*[\]\\/@]+/g, "-")
         .replace(/\.\./g, "-")
         .replace(/-+/g, "-")
@@ -165,10 +182,59 @@ window.__ModuleLoader__.load({
       // surrogate pair ('a' + 40 emoji is 81 units -> lone surrogate).
       const cut = Array.from(s).slice(0, 80).join("");
       // The slice can re-expose a trailing dot (a 79-char prefix ending in
-      // '.'), which git forbids — strip it again, then guard the reserved
-      // 'HEAD' branch name and the degenerate results.
-      const out = cut.replace(/[-.]+$/g, "");
+      // '.'), which git forbids — strip it again.
+      return cut.replace(/[-.]+$/g, "");
+    };
+
+    /**
+     * The git-safe name the backend receives: `sanitizeDraft` with the
+     * degenerate results (empty, '.', '..', the reserved 'HEAD') mapped to the
+     * neutral 'wt'. The final result is guaranteed to pass
+     * `git check-ref-format refs/heads/<name>`.
+     */
+    const sanitizeName = (raw) => {
+      const out = sanitizeDraft(raw);
       return out === "" || out === "." || out === ".." || out === "HEAD" ? "wt" : out;
+    };
+
+    /**
+     * UI verdict for the create input: `valid` gates the create actions and
+     * `name` is the sanitized value to POST (empty when invalid). `changed`
+     * is true when sanitizing actually altered the trimmed input, so the
+     * popover can preview the transformation before the user commits.
+     */
+    const namePlan = (raw) => {
+      const draft = sanitizeDraft(raw);
+      const valid = draft !== "" && draft !== "." && draft !== ".." && draft !== "HEAD";
+      const trimmed = String(raw).trim();
+      return { valid, name: valid ? draft : "", preview: draft, changed: valid && draft !== trimmed, raw: trimmed };
+    };
+
+    /** First 8 chars of a commit id for display; short/null values pass through. */
+    const shortSha = (sha) => (typeof sha === "string" && sha.length > 8 ? sha.slice(0, 8) : sha);
+
+    /** Gap kept between a clamped popover and the viewport edge. */
+    const POPOVER_MARGIN = 8;
+
+    /**
+     * Keep a fixed-position popover inside the desktop viewport. The anchor is
+     * the row control's rect (right edge, top); a popover near the right or
+     * bottom edge is pulled back so its actions stay reachable, and the
+     * stylesheet bounds its height with scrolling for long content.
+     */
+    const clampPopover = (elem, anchor) => {
+      if (elem === null || elem === undefined) return;
+      const view = elem.ownerDocument?.defaultView;
+      if (view === null || view === undefined) return;
+      const vw = Number.isFinite(view.innerWidth) && view.innerWidth > 0 ? view.innerWidth : 0;
+      const vh = Number.isFinite(view.innerHeight) && view.innerHeight > 0 ? view.innerHeight : 0;
+      const rect = typeof elem.getBoundingClientRect === "function" ? elem.getBoundingClientRect() : { width: 0, height: 0 };
+      const width = rect.width || 0;
+      const height = rect.height || 0;
+      const left = vw > 0 ? Math.min(Math.max(anchor.left, POPOVER_MARGIN), Math.max(POPOVER_MARGIN, vw - width - POPOVER_MARGIN)) : anchor.left;
+      const top = vh > 0 ? Math.min(Math.max(anchor.top, POPOVER_MARGIN), Math.max(POPOVER_MARGIN, vh - height - POPOVER_MARGIN)) : anchor.top;
+      elem.style.left = left + "px";
+      elem.style.top = top + "px";
     };
 
     /**
@@ -194,6 +260,75 @@ window.__ModuleLoader__.load({
           || x.running !== y.running) return false;
       }
       return true;
+    };
+
+    /**
+     * macOS canonical aliasing is resolved by the HOST, never guessed in the
+     * browser: the panel sends every raw cwd (target included) through the
+     * `bindings` route, which realpath-resolves each one and returns the
+     * registered `worktree.path`. Two raw cwds alias exactly when those
+     * host-resolved paths match, so the client compares them byte-for-byte and
+     * never strips a path prefix itself (stripping `/private` would conflate
+     * the distinct `/private/repo/...` and `/repo/...` paths).
+     */
+
+    /**
+     * Does this binding row describe the worktree whose host-resolved root is
+     * `canonicalTarget`? `canonicalTarget` must already be a host-resolved
+     * `worktree.path` (see `boundSessions`); the comparison is exact.
+     */
+    const bindingMatchesTarget = (row, canonicalTarget) => {
+      const wt = normalizePathKey(row?.worktree?.path);
+      const target = normalizePathKey(canonicalTarget);
+      if (typeof wt !== "string" || typeof target !== "string") return false;
+      return wt === target;
+    };
+
+    /**
+     * Every session bound to the worktree at `targetCwd`, given the route's
+     * per-cwd binding rows. Unlike a `find` over the session list, this keeps
+     * ALL sessions sharing a cwd, follows nested session cwds to their longest
+     * registered worktree (the host resolves that), and matches canonical
+     * aliases by the host's exact `worktree.path` rather than any browser-side
+     * prefix heuristic. The target's canonical root comes from its own row
+     * (identified by exact raw `path`), which is why the caller must include
+     * `targetCwd` in the bindings request; without that row the target cannot
+     * be resolved and no session is claimed. `running` is preserved so the
+     * caller can refuse deletion while a native agent — a child subagent
+     * included — is still writing.
+     */
+    const boundSessions = (targetCwd, allSessions, bindings) => {
+      const target = normalizePathKey(targetCwd);
+      const targetRow = bindings.find((row) => row !== null && row !== undefined
+        && normalizePathKey(row.path) === target
+        && row.worktree !== null && row.worktree !== undefined);
+      const canonicalTarget = targetRow === undefined ? null : normalizePathKey(targetRow.worktree.path);
+      if (canonicalTarget === null) return [];
+      const byCwd = new Map();
+      for (const session of allSessions) {
+        if (session === null || session === undefined || typeof session.cwd !== "string" || session.cwd === "") continue;
+        const list = byCwd.get(session.cwd);
+        if (list === undefined) byCwd.set(session.cwd, [session]);
+        else list.push(session);
+      }
+      const out = [];
+      const seen = new Set();
+      for (const row of bindings) {
+        if (row === null || row === undefined || row.worktree === null || row.worktree === undefined) continue;
+        if (!bindingMatchesTarget(row, canonicalTarget)) continue;
+        for (const session of byCwd.get(row.path) ?? []) {
+          if (seen.has(session.id)) continue;
+          seen.add(session.id);
+          out.push({
+            id: session.id,
+            title: session.displayTitle,
+            blank: session.blank === true,
+            running: session.running === true,
+          });
+        }
+      }
+      out.sort((a, b) => (a.blank ? 1 : 0) - (b.blank ? 1 : 0) || String(a.title ?? "").localeCompare(String(b.title ?? "")));
+      return out;
     };
 
     // ── worktree knowledge store (module-level, shared by sync + rows) ──────
@@ -254,8 +389,8 @@ window.__ModuleLoader__.load({
     /**
      * One synchronization pass. For every workspace that is inside a git repo:
      * ensure the repo-root workspace exists with the `（主工作树）` marker,
-     * ensure every worktree path has a workspace (so the core tree nests them
-     * under the project folder), unregister auto-created registrations whose
+     * ensure every worktree path has a workspace (each becomes its own flat
+     * project row), unregister auto-created registrations whose
      * worktree is gone (only when they hold no sessions), and republish the
      * worktree store.
      *
@@ -438,17 +573,23 @@ window.__ModuleLoader__.load({
     function WorktreeSync({ useWorkspaces, useSessions, sync, openBoundSession, archiveSessions, debounceMs = SYNC_DEBOUNCE_MS, intervalMs = SYNC_INTERVAL_MS, doc }) {
       const items = useWorkspaces((state) => state.items);
       const phase = useWorkspaces((state) => state.phase);
-      // Full conversation list (subagent children share their parent's cwd and
-      // are not bindings of their own); `sessionsSame` keeps the selection
-      // identity stable across session-store notifications.
+      // Full conversation list INCLUDING native subagent children: a running
+      // child shares its parent's cwd and writes in the same worktree, so the
+      // delete confirmation must see it and count it as an active occupant.
+      // `sessionsSame` keeps the selection identity stable across session-store
+      // notifications.
       const readSessions = typeof useSessions === "function" ? useSessions : emptySessions;
       const allSessions = readSessions((snapshot) => snapshot.ids
         .map((id) => snapshot.byId[id])
-        .filter((s) => s !== undefined && s.origin !== "subagent"),
+        .filter((s) => s !== undefined),
       sessionsSame);
       const worktreeState = react.useSyncExternalStore(worktreeStore.subscribe, worktreeStore.getSnapshot, worktreeStore.getSnapshot);
       const [popover, setPopover] = react.useState(null);
       const targetDoc = doc ?? (typeof document !== "undefined" ? document : null);
+      // Set by a busy popover: while an async create/delete is in flight the
+      // popover must not be dismissed (and lose its staged state) by an
+      // outside click or replaced by another row action.
+      const dismissGuard = react.useRef(false);
 
       // Latest-value ref: the observer never has to re-subscribe when props or
       // workspace data change.
@@ -490,6 +631,7 @@ window.__ModuleLoader__.load({
           readItems: () => latest.current.items,
           readWorktreeState: () => worktreeStore.state,
           onAction: (action) => {
+            if (dismissGuard.current) return;
             if (action.kind === "ambiguous") {
               latest.current.setPopover({ kind: "choose", anchor: action.anchor, candidates: action.candidates });
               return;
@@ -529,6 +671,7 @@ window.__ModuleLoader__.load({
               || elem.closest(".gwt-rowPlus") !== null
               || elem.closest(".gwt-rowRemove") !== null
               || elem.closest(".gwt-rowAmbiguous") !== null)) return;
+          if (dismissGuard.current) return;
           setPopover(null);
         };
         targetDoc.addEventListener("pointerdown", onPointerDown);
@@ -541,8 +684,9 @@ window.__ModuleLoader__.load({
           target: popover.target,
           anchor: popover.anchor,
           openBoundSession,
+          guard: dismissGuard,
           onClose: () => setPopover(null),
-        });
+        }, popover.target.workspaceId ?? popover.target.cwd);
       }
       if (popover.kind === "remove") {
         // Retargeting the popover from one row to another must reset its
@@ -555,6 +699,7 @@ window.__ModuleLoader__.load({
           allSessions,
           sync,
           archiveSessions,
+          guard: dismissGuard,
           onClose: () => setPopover(null),
         }, popover.target.workspaceId ?? popover.target.cwd);
       }
@@ -717,7 +862,7 @@ window.__ModuleLoader__.load({
         onAction({
           kind: resolution.kind,
           candidates: resolution.candidates,
-          anchor: { left: rect.right + 8, top: rect.top },
+          anchor: { left: rect.right + 8, top: rect.top, trigger: button },
         });
       });
       actions.appendChild(button);
@@ -747,7 +892,8 @@ window.__ModuleLoader__.load({
         const byPath = readWorktreeState()?.byPath ?? new Map();
         for (const tree of doc.querySelectorAll(TREE_SELECTOR)) {
           for (const row of tree.querySelectorAll(ROW_SELECTOR)) {
-            applyRow(row, resolveRow(row, items, byPath), onAction);
+            const resolution = resolveRow(row, items, byPath);
+            applyRow(row, resolution, onAction);
           }
         }
       };
@@ -796,70 +942,232 @@ window.__ModuleLoader__.load({
     };
 
     // ── anchored popovers ───────────────────────────────────────────────────
-    /** Shared fixed-position popover chrome; row events never leak through it. */
-    const popoverProps = (anchor) => ({
-      className: "gwt-createPop",
-      style: { left: anchor.left, top: anchor.top },
-      onClick: stopPopoverEvent,
-      onPointerDown: stopPopoverEvent,
-      onMouseDown: stopPopoverEvent,
-    });
+    /**
+     * Shared fixed-position popover chrome; row events never leak through it.
+     * `label` names the dialog for assistive tech; `onDismiss` (when given)
+     * handles Escape while idle — the caller decides whether busy blocks it.
+     */
+    const popoverProps = (anchor, label, onDismiss) => {
+      const props = {
+        className: "gwt-createPop",
+        role: "dialog",
+        "aria-label": label,
+        tabIndex: -1,
+        style: { left: anchor.left, top: anchor.top },
+        onClick: stopPopoverEvent,
+        onPointerDown: stopPopoverEvent,
+        onMouseDown: stopPopoverEvent,
+      };
+      if (typeof onDismiss === "function") {
+        props.onKeyDown = (event) => {
+          if (event.key === "Escape") {
+            event.stopPropagation();
+            onDismiss();
+          }
+        };
+      }
+      return props;
+    };
 
     /**
-     * "新增工作树": create the worktree (optionally opening the bound session
-     * rooted at it) and close. Replaces the removed slot's create chain.
+     * Popover plumbing shared by all three surfaces: clamp the fixed position
+     * into the viewport on mount/resize/content growth, move focus in on open,
+     * and restore it to the row control on unmount.
      */
-    function CreateWorktreePopover({ target, anchor, openBoundSession, onClose }) {
+    const usePopoverRoot = (anchor) => {
+      const ref = react.useRef(null);
+      react.useLayoutEffect(() => {
+        const elem = ref.current;
+        if (elem === null) return;
+        const reposition = () => clampPopover(elem, anchor);
+        reposition();
+        const view = elem.ownerDocument?.defaultView;
+        if (view === null || view === undefined) return;
+        view.addEventListener("resize", reposition);
+        let observer = null;
+        if (typeof view.ResizeObserver === "function") {
+          observer = new view.ResizeObserver(() => reposition());
+          observer.observe(elem);
+        }
+        return () => {
+          view.removeEventListener("resize", reposition);
+          observer?.disconnect();
+        };
+      }, [anchor.left, anchor.top]);
+      react.useEffect(() => {
+        const elem = ref.current;
+        if (elem === null) return;
+        const current = elem.ownerDocument?.activeElement;
+        if (current === null || current === undefined || !elem.contains(current)) {
+          try { elem.focus({ preventScroll: true }); } catch { /* jsdom/older engines */ }
+        }
+      }, []);
+      react.useEffect(() => {
+        const trigger = anchor.trigger;
+        return () => {
+          if (trigger !== null && trigger !== undefined && trigger.isConnected === true) {
+            try { trigger.focus(); } catch { /* the row was replaced by reconciliation */ }
+          }
+        };
+      }, [anchor]);
+      return ref;
+    };
+
+    /**
+     * "新增工作树": create the worktree and, when asked, open its bound session.
+     * The git creation runs at most once per popover (a synchronous ref guards
+     * double-clicks AND an open-session retry); a created-but-unopened result
+     * stays visible with its real path/branch so it is usable before the
+     * sidebar poll picks the workspace up.
+     */
+    function CreateWorktreePopover({ target, anchor, openBoundSession, onClose, guard }) {
       const [name, setName] = react.useState("");
       const [busy, setBusy] = react.useState(false);
+      const [phase, setPhase] = react.useState(null); // 'creating' | 'opening'
+      const [busyAction, setBusyAction] = react.useState(null); // 'worktree' | 'session'
       const [error, setError] = react.useState(null);
+      const [created, setCreated] = react.useState(null);
+      // Synchronous guards: React state is not updated between two clicks in
+      // the same tick, so a ref must reject the duplicate create and remember
+      // the git result a retry must not re-POST.
+      const inFlight = react.useRef(false);
+      const createdRef = react.useRef(null);
+      // The host's click-outside handler consults this ref: a busy create must
+      // not be dismissed mid-flight (which would lose the created result).
+      react.useEffect(() => {
+        guard.current = busy;
+        return () => { guard.current = false; };
+      }, [busy, guard]);
+      const plan = namePlan(name);
+      const invalid = name.trim() !== "" && !plan.valid;
 
-      const doCreate = async (withSession) => {
-        const base = sanitizeName(name);
-        if (base === "" || busy) return;
+      const runCreate = async (withSession) => {
+        if (inFlight.current || !plan.valid) return;
+        inFlight.current = true;
         setBusy(true);
         setError(null);
+        setBusyAction(withSession ? "session" : "worktree");
         try {
-          const result = await post("add", { repo: target.cwd, name: base, unique: true });
-          let opened = null;
-          if (withSession && result.absolutePath !== undefined && result.absolutePath !== null && result.absolutePath !== "") {
-            opened = await openBoundSession(result.absolutePath);
+          let result = createdRef.current;
+          if (result === null) {
+            setPhase("creating");
+            const data = await post("add", { repo: target.cwd, name: plan.name, unique: true });
+            const path = data.absolutePath ?? data.path ?? "";
+            result = { path, branch: data.branch ?? plan.name };
+            createdRef.current = result;
+            setCreated(result);
           }
-          if (withSession && opened !== null && !opened.ok) {
-            // Keep the popover open so the failure reason is visible; the
-            // worktree folder's ＋ can start a session later.
-            setError(opened.message ?? "工作树已创建；会话打开失败 — 可点击该工作树文件夹的 ＋ 新建会话");
+          if (!withSession) return; // keep the success panel open for 打开/完成
+          setPhase("opening");
+          const opened = await openBoundSession(result.path);
+          if (opened !== null && opened !== undefined && opened.ok) {
+            onClose();
             return;
           }
-          setName("");
-          onClose();
+          setError(opened?.message ?? "工作树已创建，但打开绑定会话失败，可点击“打开绑定会话”重试。");
         } catch (e) {
+          // A failure before the git result exists is a create error; after it,
+          // the worktree is already there and only the session step failed.
           setError(e instanceof Error ? e.message : String(e));
         } finally {
+          inFlight.current = false;
           setBusy(false);
+          setPhase(null);
+          setBusyAction(null);
         }
       };
 
-      return react_jsx_runtime.jsxs("div", {
-        ...popoverProps(anchor),
+      const rootRef = usePopoverRoot(anchor);
+      const dismiss = () => { if (!busy) onClose(); };
+      const shared = { ref: rootRef, ...popoverProps(anchor, "新增工作树", dismiss) };
+      const head = react_jsx_runtime.jsxs("div", {
+        className: "gwt-head",
         children: [
-          react_jsx_runtime.jsxs("div", {
-            className: "gwt-head",
+          react_jsx_runtime.jsx("span", { children: "新增工作树：" + target.label }),
+          react_jsx_runtime.jsx("span", { className: "gwt-popPath", children: target.cwd }),
+        ],
+      });
+
+      if (created !== null) {
+        return react_jsx_runtime.jsxs("div", {
+          ...shared,
+          children: [
+            head,
+            react_jsx_runtime.jsxs("div", {
+              className: "gwt-created",
+              children: [
+                react_jsx_runtime.jsx("span", { className: "gwt-createdTitle", children: "工作树已创建" }),
+                react_jsx_runtime.jsx("span", { className: "gwt-createdPath", children: created.path }),
+                created.branch !== null && created.branch !== undefined && created.branch !== ""
+                  && react_jsx_runtime.jsx("span", { className: "gwt-popBranch", children: "分支：" + created.branch }),
+                error !== null && react_jsx_runtime.jsx("p", { className: "gwt-error", children: error }),
+              ],
+            }),
+            react_jsx_runtime.jsxs("div", {
+              className: "gwt-createRow",
+              children: [
+                react_jsx_runtime.jsx("button", {
+                  type: "button",
+                  className: "gwt-btn",
+                  disabled: busy,
+                  onClick: onClose,
+                  children: "完成",
+                }),
+                react_jsx_runtime.jsx("button", {
+                  type: "button",
+                  className: "gwt-btn gwt-btnPrimary",
+                  disabled: busy,
+                  onClick: () => void runCreate(true),
+                  children: busy && busyAction === "session" && phase === "opening" ? "正在打开会话…" : "打开绑定会话",
+                }),
+              ],
+            }),
+          ],
+        });
+      }
+
+      const busyCopy = (action) => {
+        if (!busy || busyAction !== action) return null;
+        return phase === "creating" ? "创建中…" : "正在打开会话…";
+      };
+
+      return react_jsx_runtime.jsxs("div", {
+        ...shared,
+        children: [
+          head,
+          react_jsx_runtime.jsxs("label", {
+            className: "gwt-field",
             children: [
-              react_jsx_runtime.jsx("span", { children: "新增工作树：" + target.label }),
-              react_jsx_runtime.jsx("span", { className: "gwt-popPath", children: target.cwd }),
+              react_jsx_runtime.jsx("span", { className: "gwt-fieldLabel", children: "工作树名称" }),
+              react_jsx_runtime.jsx("input", {
+                className: "gwt-createInput",
+                value: name,
+                placeholder: "例如：login-page",
+                disabled: busy,
+                "aria-invalid": invalid ? true : undefined,
+                "aria-describedby": "gwt-create-hint",
+                onChange: (event) => setName(event.target.value),
+                onKeyDown: (event) => {
+                  if (event.key !== "Enter") return;
+                  const composing = event.nativeEvent?.isComposing === true || event.isComposing === true;
+                  if (!composing && !busy && plan.valid) void runCreate(true);
+                },
+                autoFocus: true,
+              }),
             ],
           }),
-          react_jsx_runtime.jsx("input", {
-            className: "gwt-createInput",
-            value: name,
-            placeholder: "feature name → .dsh-wt/<name>（自动打开绑定会话）",
-            onChange: (event) => setName(event.target.value),
-            onKeyDown: (event) => {
-              if (event.key === "Enter" && !busy && name.trim() !== "") void doCreate(true);
-              if (event.key === "Escape") onClose();
-            },
-            autoFocus: true,
+          react_jsx_runtime.jsx("span", {
+            className: "gwt-fieldHint",
+            id: "gwt-create-hint",
+            children: "例如：login-page；将创建 .dsh-wt/<名称> 与同名分支。",
+          }),
+          plan.valid && plan.changed && react_jsx_runtime.jsx("span", {
+            className: "gwt-preview",
+            children: "将创建 " + target.cwd + "/.dsh-wt/" + plan.name + "（分支 " + plan.name + "）",
+          }),
+          invalid && react_jsx_runtime.jsx("p", {
+            className: "gwt-fieldError",
+            children: "名称无效：不能只包含空格、-、.、/ 等符号；请使用字母、数字或中文。",
           }),
           error !== null && react_jsx_runtime.jsx("p", { className: "gwt-error", children: error }),
           react_jsx_runtime.jsxs("div", {
@@ -868,16 +1176,23 @@ window.__ModuleLoader__.load({
               react_jsx_runtime.jsx("button", {
                 type: "button",
                 className: "gwt-btn",
-                disabled: busy || name.trim() === "",
-                onClick: () => void doCreate(false),
-                children: "仅创建工作树",
+                disabled: busy,
+                onClick: dismiss,
+                children: "取消",
+              }),
+              react_jsx_runtime.jsx("button", {
+                type: "button",
+                className: "gwt-btn",
+                disabled: busy || !plan.valid,
+                onClick: () => void runCreate(false),
+                children: busyCopy("worktree") ?? "仅创建工作树",
               }),
               react_jsx_runtime.jsx("button", {
                 type: "button",
                 className: "gwt-btn gwt-btnPrimary",
-                disabled: busy || name.trim() === "",
-                onClick: () => void doCreate(true),
-                children: busy ? "…" : "创建绑定会话",
+                disabled: busy || !plan.valid,
+                onClick: () => void runCreate(true),
+                children: busyCopy("session") ?? "创建绑定会话",
               }),
             ],
           }),
@@ -886,16 +1201,43 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * "删除工作树？": lists the conversations bound to `target.cwd`, offers to
-     * archive them, removes the git worktree and unregisters its workspace.
+     * "删除工作树？": lists every conversation bound to `target.cwd` (native
+     * subagent children included), offers to archive them, then removes the git
+     * worktree and unregisters its workspace. Removal is git-first and staged:
+     * a failure after the git step retries only the unfinished cleanup. While
+     * any listed session is `running`, deletion is disabled with an explicit
+     * explanation; idle peers are listed but never called active writers.
      */
-    function RemoveWorktreePopover({ target, anchor, allSessions, sync, archiveSessions, onClose }) {
+    function RemoveWorktreePopover({ target, anchor, allSessions, sync, archiveSessions, onClose, guard }) {
       const [removing, setRemoving] = react.useState({ sessions: [], archive: false });
       const [bindingReady, setBindingReady] = react.useState(false);
+      const [started, setStarted] = react.useState(false);
       const [busy, setBusy] = react.useState(false);
-      const [error, setError] = react.useState(null);
+      const [error, setError] = react.useState(null);               // binding resolution
+      const [cleanupError, setCleanupError] = react.useState(null); // git-first cleanup { phase, message }
+      const [reload, setReload] = react.useState(0);
+      // Staged cleanup, stable across retries: which steps are DONE, the pending
+      // session ids and the archive choice. `frozen` flips only AFTER git
+      // confirms the worktree is gone: the ids must then survive the
+      // post-removal binding re-resolution (the worktree no longer exists, so a
+      // fresh resolve would otherwise erase the list a retry still needs). A
+      // failed git removal leaves the plan unfrozen so the roster re-resolves.
+      // `inFlight` is the synchronous re-entry guard (React `busy` state is not).
+      const cleanup = react.useRef({ frozen: false, inFlight: false, gitRemoved: false, archived: false, unregistered: false, archive: false, sessions: [] });
+      const rootRef = usePopoverRoot(anchor);
+      const dismiss = () => { if (!busy) onClose(); };
+      // The host's click-outside handler consults this ref: a busy delete must
+      // not be dismissed (and lose its staged progress) by an outside click.
+      react.useEffect(() => {
+        guard.current = busy;
+        return () => { guard.current = false; };
+      }, [busy, guard]);
 
       react.useEffect(() => {
+        // Once the git removal has actually succeeded the roster is frozen:
+        // session-store churn and the disappearance of the worktree must not
+        // revoke the confirmation or wipe the pending list a retry still needs.
+        if (cleanup.current.frozen) return;
         let cancelled = false;
         // A retarget (or a session-store change) invalidates the previous
         // bound-session list: clear it and keep the confirm action disabled
@@ -905,16 +1247,14 @@ window.__ModuleLoader__.load({
         setError(null);
         const resolveBound = async () => {
           try {
-            const cwds = [...new Set(allSessions.map((s) => s.cwd).filter(Boolean))];
+            // The target's own cwd is requested FIRST (its row must survive the
+            // route's input cap) alongside every session cwd, so the host
+            // returns the canonical worktree root for the target too; matching
+            // must never rely on a browser-side path heuristic.
+            const requested = [target.cwd, ...allSessions.map((s) => s?.cwd)];
+            const cwds = [...new Set(requested.filter((cwd) => typeof cwd === "string" && cwd !== ""))];
             const data = await resolveBindings(cwds);
-            const bound = [];
-            for (const row of data.bindings) {
-              if (row.worktree === null || row.worktree.path !== target.cwd) continue;
-              const session = allSessions.find((s) => s.cwd === row.path);
-              if (session === undefined) continue;
-              bound.push({ id: session.id, title: session.displayTitle, blank: session.blank });
-            }
-            bound.sort((a, b) => (a.blank ? 1 : 0) - (b.blank ? 1 : 0) || a.title.localeCompare(b.title));
+            const bound = boundSessions(target.cwd, allSessions, data?.bindings ?? []);
             if (!cancelled) {
               setRemoving({ sessions: bound, archive: bound.length > 0 });
               setBindingReady(true);
@@ -925,38 +1265,74 @@ window.__ModuleLoader__.load({
         };
         void resolveBound();
         return () => { cancelled = true; };
-      }, [target.cwd, allSessions]);
+      }, [target.cwd, target.info, allSessions, reload]);
+
+      const runningSessions = removing.sessions.filter((s) => s.running);
+      const blockedByRunning = runningSessions.length > 0;
+      const canRemove = bindingReady && !busy && !blockedByRunning
+        && target.info !== null && target.info !== undefined;
 
       const confirmRemove = async () => {
-        if (busy || !bindingReady) return;
-        if (target.info === null) {
-          setError("该文件夹不是已检测到的工作树");
-          return;
+        if (!canRemove) return;
+        const plan = cleanup.current;
+        // Re-entry guard: a double-click (or a stale retry racing an in-flight
+        // attempt) must not run the staged steps twice.
+        if (plan.inFlight) return;
+        // Capture the roster/choice while the plan is still unfrozen, i.e.
+        // before the git removal has actually happened. A failed removal leaves
+        // it unfrozen so the roster can be re-resolved and the choice changed.
+        if (!plan.frozen) {
+          plan.archive = removing.archive && removing.sessions.length > 0;
+          plan.sessions = removing.sessions.map((s) => s.id);
         }
+        plan.inFlight = true;
         setBusy(true);
-        setError(null);
+        setCleanupError(null);
         try {
-          if (removing.archive && removing.sessions.length > 0) {
-            await archiveSessions(removing.sessions.map((s) => s.id));
+          // 1. git first: never archive before the worktree is really gone.
+          //    Freeze the roster only after git confirms deletion, so a git
+          //    failure never locks the confirmation against a re-resolved —
+          //    possibly running — roster.
+          if (!plan.gitRemoved) {
+            await post("remove", { repo: target.info.repoRoot, path: target.cwd });
+            plan.gitRemoved = true;
+            plan.frozen = true;
+            setStarted(true);
           }
-          await post("remove", { repo: target.info.repoRoot, path: target.cwd });
-          if (target.workspaceId !== undefined) {
-            try {
-              await sync.delete(target.workspaceId);
-            } catch {
-              /* registration already gone — fine */
+          // 2. archive the frozen ids if chosen, one at a time: an id that
+          //    already archived is never re-sent after a mid-list failure, and a
+          //    retry resumes with only the unfinished ids.
+          if (plan.archive && !plan.archived) {
+            while (plan.sessions.length > 0) {
+              await archiveSessions([plan.sessions[0]]);
+              plan.sessions = plan.sessions.slice(1);
             }
+            plan.archived = true;
+          }
+          // 3. unregister the folder; failures are surfaced, not swallowed.
+          if (!plan.unregistered && target.workspaceId !== undefined) {
+            await sync.delete(target.workspaceId);
+            plan.unregistered = true;
           }
           onClose();
         } catch (e) {
-          setError(e instanceof Error ? e.message : String(e));
+          // `gitRemoved` distinguishes "Git refused to delete the worktree
+          // (it still exists)" from "the directory is gone but archive/
+          // unregister did not finish", so the UI can explain the right
+          // recovery instead of showing a raw English git error.
+          setCleanupError({
+            phase: plan.gitRemoved ? "cleanup" : "git",
+            message: e instanceof Error ? e.message : String(e),
+          });
         } finally {
+          plan.inFlight = false;
           setBusy(false);
         }
       };
 
       return react_jsx_runtime.jsxs("div", {
-        ...popoverProps(anchor),
+        ...popoverProps(anchor, "删除工作树", dismiss),
+        ref: rootRef,
         children: [
           react_jsx_runtime.jsxs("div", {
             className: "gwt-head",
@@ -965,31 +1341,60 @@ window.__ModuleLoader__.load({
               react_jsx_runtime.jsx("span", { className: "gwt-popPath", children: target.cwd }),
             ],
           }),
-          target.info !== null && react_jsx_runtime.jsx("span", {
+          target.info !== null && target.info !== undefined && react_jsx_runtime.jsx("span", {
             className: "gwt-popBranch",
-            children: (target.info.branch ?? "(detached)") + " @ " + (target.info.head ?? "?"),
+            title: target.info.head ?? undefined,
+            children: (target.info.branch ?? "(detached)") + " @ " + (shortSha(target.info.head) ?? "?"),
+          }),
+          !bindingReady && error === null && react_jsx_runtime.jsx("span", {
+            className: "gwt-note",
+            children: "正在解析绑定会话…",
           }),
           removing.sessions.length > 0 && react_jsx_runtime.jsx("span", {
             className: "gwt-boundList",
-            children: "绑定会话（" + removing.sessions.length + "）：" + removing.sessions.map((s) => s.title).join("、"),
+            children: "绑定会话（" + removing.sessions.length + "）："
+              + removing.sessions.map((s) => (s.running ? s.title + "（运行中）" : s.title)).join("、"),
           }),
-          removing.sessions.length === 0 && react_jsx_runtime.jsx("span", {
+          bindingReady && removing.sessions.length === 0 && react_jsx_runtime.jsx("span", {
             className: "gwt-note",
-            children: "无绑定会话；删除后文件夹从树中移除。",
+            children: "无绑定会话；删除后工作树目录移除、分支仍保留。",
           }),
-          react_jsx_runtime.jsxs("label", {
+          blockedByRunning && react_jsx_runtime.jsx("p", {
+            className: "gwt-error",
+            children: "有会话正在运行（" + runningSessions.map((s) => s.title).join("、")
+              + "），已停用删除；请先停止这些会话再重试。",
+          }),
+          (!bindingReady || removing.sessions.length > 0) && react_jsx_runtime.jsxs("label", {
             className: "gwt-check",
             children: [
               react_jsx_runtime.jsx("input", {
                 type: "checkbox",
                 checked: removing.archive,
-                disabled: !bindingReady || removing.sessions.length === 0,
+                disabled: !bindingReady || busy || started || removing.sessions.length === 0,
                 onChange: (event) => setRemoving({ ...removing, archive: event.target.checked }),
               }),
               "一并归档这些会话（日志保留，侧边栏隐藏）",
             ],
           }),
-          error !== null && react_jsx_runtime.jsx("p", { className: "gwt-error", children: error }),
+          error !== null && react_jsx_runtime.jsx("p", { className: "gwt-error", children: "绑定信息加载失败：" + error }),
+          cleanupError !== null && react_jsx_runtime.jsxs("div", {
+            className: "gwt-cleanupError",
+            children: [
+              react_jsx_runtime.jsx("p", {
+                className: "gwt-error",
+                children: cleanupError.phase === "git"
+                  ? "Git 未能删除该工作树，目录仍然存在。工作树内有未提交或未跟踪的改动时 Git 会拒绝删除；请先在工作树中保存、提交或 stash 这些改动，然后重试。插件不会自动强制删除。"
+                  : "工作树目录已删除，但后续清理未完成（会话归档或工作区注销）。可点击“重试清理”继续未完成的步骤，不会再次删除 git 工作树。",
+              }),
+              react_jsx_runtime.jsxs("details", {
+                className: "gwt-details",
+                children: [
+                  react_jsx_runtime.jsx("summary", { children: "技术详情" }),
+                  react_jsx_runtime.jsx("span", { className: "gwt-rawError", children: cleanupError.message }),
+                ],
+              }),
+            ],
+          }),
           react_jsx_runtime.jsxs("div", {
             className: "gwt-confirmRow",
             children: [
@@ -997,15 +1402,22 @@ window.__ModuleLoader__.load({
                 type: "button",
                 className: "gwt-btn",
                 disabled: busy,
-                onClick: onClose,
+                onClick: dismiss,
                 children: "取消",
+              }),
+              error !== null && !started && react_jsx_runtime.jsx("button", {
+                type: "button",
+                className: "gwt-btn",
+                disabled: busy,
+                onClick: () => setReload((value) => value + 1),
+                children: "重试加载",
               }),
               react_jsx_runtime.jsx("button", {
                 type: "button",
                 className: "gwt-btn gwt-btnDanger",
-                disabled: busy || !bindingReady,
+                disabled: !canRemove,
                 onClick: () => void confirmRemove(),
-                children: busy ? "…" : "确认删除",
+                children: busy ? (started ? "清理中…" : "删除中…") : cleanupError !== null ? "重试清理" : "确认删除",
               }),
             ],
           }),
@@ -1015,8 +1427,10 @@ window.__ModuleLoader__.load({
 
     /** Explicit repository picker for same-label rows (never guess silently). */
     function WorkspaceChooser({ anchor, candidates, onPick, onClose }) {
+      const rootRef = usePopoverRoot(anchor);
       return react_jsx_runtime.jsxs("div", {
-        ...popoverProps(anchor),
+        ...popoverProps(anchor, "选择工作区", onClose),
+        ref: rootRef,
         children: [
           react_jsx_runtime.jsxs("div", {
             className: "gwt-head",
@@ -1109,7 +1523,13 @@ window.__ModuleLoader__.load({
     // engine, and the row-integration primitives. Not part of the public API.
     exports._test = {
       sanitizeName,
+      sanitizeDraft,
+      namePlan,
+      shortSha,
+      clampPopover,
       sessionsSame,
+      boundSessions,
+      bindingMatchesTarget,
       api,
       runSync,
       worktreeStore,

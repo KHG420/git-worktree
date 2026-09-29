@@ -47,7 +47,7 @@ const fakeRequire = (spec) => {
   throw new Error(`unexpected require: ${spec}`)
 }
 const testSurface = captured.factory(fakeRequire)._test
-const { sanitizeName, sessionsSame, api, runSync, worktreeStore, loadAuto, saveAuto, _reset } = testSurface
+const { sanitizeName, sanitizeDraft, namePlan, shortSha, clampPopover, sessionsSame, api, runSync, worktreeStore, loadAuto, saveAuto, _reset } = testSurface
 
 // ── sanitizeName ────────────────────────────────────────────────────────────
 
@@ -163,6 +163,73 @@ t('sanitizeName: every output passes git check-ref-format (property matrix)', ()
   }
 })
 
+// ── namePlan / sanitizeDraft (UI validation vs. the git-safe fallback) ───────
+
+t('sanitizeDraft/namePlan: invalid names are rejected by the UI', () => {
+  assert.equal(sanitizeDraft(''), '')
+  assert.equal(sanitizeDraft('   '), '')
+  assert.equal(sanitizeDraft('///'), '', 'only-forbidden input has no legal content')
+  assert.equal(sanitizeDraft('...'), '')
+  assert.equal(sanitizeDraft('a b'), 'a-b')
+  assert.equal(namePlan('').valid, false, 'blank is invalid')
+  assert.equal(namePlan('   ').valid, false)
+  assert.equal(namePlan('///').valid, false)
+  assert.equal(namePlan('...').valid, false)
+  assert.equal(namePlan('HEAD').valid, false, 'the reserved ref name is invalid')
+  assert.equal(namePlan('///').name, '', 'no name to POST for an invalid draft')
+})
+
+t('sanitizeDraft/namePlan: legal names carry the sanitized value + change flag', () => {
+  const unicode = namePlan('功能 开发')
+  assert.equal(unicode.valid, true)
+  assert.equal(unicode.name, '功能-开发', 'non-ASCII survives')
+  assert.equal(unicode.changed, true)
+  const spaced = namePlan('ux review 20260919')
+  assert.equal(spaced.valid, true)
+  assert.equal(spaced.name, 'ux-review-20260919')
+  assert.equal(spaced.changed, true, 'preview is shown when the name changes')
+  const clean = namePlan('login-page')
+  assert.equal(clean.valid, true)
+  assert.equal(clean.changed, false, 'no preview when the name is unchanged')
+  assert.equal(namePlan(' new-feat ').changed, false, 'surrounding whitespace alone is not a change')
+})
+
+t('namePlan: the shipped sanitizeName fallback still returns wt', () => {
+  // Regression guard: the UI validation must not change the git-safe helper the
+  // rest of the bundle (and the POST body) relies on.
+  assert.equal(sanitizeName('///'), 'wt')
+  assert.equal(sanitizeName('...'), 'wt')
+  assert.equal(sanitizeName(''), 'wt')
+  assert.equal(sanitizeName('HEAD'), 'wt')
+  assert.equal(namePlan('a b').name, sanitizeName('a b'))
+})
+
+t('shortSha: trims a long hash but leaves short/detached values alone', () => {
+  const long = '0123456789abcdef0123456789abcdef01234567'
+  assert.equal(shortSha(long), '01234567')
+  assert.equal(shortSha('bbb'), 'bbb')
+  assert.equal(shortSha(null), null)
+  assert.equal(shortSha(undefined), undefined)
+})
+
+t('clampPopover: right/bottom anchors are pulled inside the viewport', () => {
+  const view = { innerWidth: 1024, innerHeight: 768 }
+  const elem = {
+    ownerDocument: { defaultView: view },
+    style: {},
+    getBoundingClientRect: () => ({ width: 300, height: 200 }),
+  }
+  clampPopover(elem, { left: 5000, top: 5000 })
+  assert.equal(elem.style.left, '716px', '1024 - 300 - 8')
+  assert.equal(elem.style.top, '560px', '768 - 200 - 8')
+  clampPopover(elem, { left: -40, top: -40 })
+  assert.equal(elem.style.left, '8px', 'negative anchors get the margin')
+  assert.equal(elem.style.top, '8px')
+  clampPopover(elem, { left: 100, top: 100 })
+  assert.equal(elem.style.left, '100px', 'in-view anchors are not moved')
+  assert.equal(elem.style.top, '100px')
+})
+
 // ── sessionsSame ────────────────────────────────────────────────────────────
 
 const S = (id, cwd, extra = {}) => ({ id, cwd, origin: 'user', displayTitle: id, blank: false, running: false, ...extra })
@@ -191,6 +258,77 @@ t('sessionsSame: any rendered field change breaks equality', () => {
 t('sessionsSame: undefined entries are handled', () => {
   assert.equal(sessionsSame([undefined], [undefined]), true)
   assert.equal(sessionsSame([S('s1', '/a')], [undefined]), false)
+})
+
+// ── boundSessions: the delete-confirmation roster ───────────────────────────
+
+const { boundSessions } = testSurface
+const B = (cwd, worktreePath, root = '/repo') => ({ path: cwd, root, worktree: { path: worktreePath } })
+
+t('boundSessions: keeps EVERY session at a cwd, follows nested cwds, excludes siblings', () => {
+  const sessions = [
+    S('s1', '/repo'),
+    S('s2', '/repo/.dsh-wt/feat-a', { displayTitle: 'a' }),
+    S('s3', '/repo/.dsh-wt/feat-a', { displayTitle: 'a2', blank: true }),
+    S('s4', '/repo/.dsh-wt/feat-a/deep', { displayTitle: 'nested', running: true }),
+    S('s5', '/repo/.dsh-wt/other', { displayTitle: 'other' }),
+  ]
+  const bindings = [
+    B('/repo', '/repo'),
+    B('/repo/.dsh-wt/feat-a', '/repo/.dsh-wt/feat-a'),
+    B('/repo/.dsh-wt/feat-a/deep', '/repo/.dsh-wt/feat-a'),
+    B('/repo/.dsh-wt/other', '/repo/.dsh-wt/other'),
+  ]
+  const bound = boundSessions('/repo/.dsh-wt/feat-a', sessions, bindings)
+  assert.deepEqual(bound.map((s) => s.id).sort(), ['s2', 's3', 's4'], 'both same-cwd sessions + the nested child; the sibling excluded')
+  assert.equal(bound.find((s) => s.id === 's4').running, true, 'running preserved for the occupancy guard')
+  assert.equal(bound[bound.length - 1].id, 's3', 'blank sessions sort last')
+})
+
+t('boundSessions: zero sessions and zero bindings are empty', () => {
+  assert.deepEqual(boundSessions('/repo/.dsh-wt/feat-a', [], []), [])
+  assert.deepEqual(boundSessions('/repo/.dsh-wt/feat-a', [S('s1', '/repo')], []), [])
+})
+
+t('boundSessions: aliased raw cwds resolve to the same host-canonical worktree root', () => {
+  // The host resolves both the target and the session's raw cwd to one
+  // canonical `worktree.path`; the alias matches by exact host identity even
+  // though the raw strings differ. No browser-side `/private` stripping.
+  const sessions = [S('s1', '/private/repo/.dsh-wt/feat-a')]
+  const bindings = [
+    B('/repo/.dsh-wt/feat-a', '/repo/.dsh-wt/feat-a', '/repo'),
+    B('/private/repo/.dsh-wt/feat-a', '/repo/.dsh-wt/feat-a', '/repo'),
+  ]
+  assert.deepEqual(
+    boundSessions('/repo/.dsh-wt/feat-a', sessions, bindings).map((s) => s.id),
+    ['s1'],
+    'same host-canonical worktree root matches despite the raw alias',
+  )
+})
+
+t('boundSessions: distinct /private and /repo worktrees are never conflated', () => {
+  // A raw `/private/repo/...` cwd whose HOST-resolved worktree root is a
+  // different path than the target's is a different worktree, not an alias.
+  const sessions = [S('s1', '/private/repo/.dsh-wt/feat-a')]
+  const bindings = [
+    B('/repo/.dsh-wt/feat-a', '/repo/.dsh-wt/feat-a', '/repo'),
+    B('/private/repo/.dsh-wt/feat-a', '/private/repo/.dsh-wt/feat-a', '/private/repo'),
+  ]
+  assert.deepEqual(boundSessions('/repo/.dsh-wt/feat-a', sessions, bindings), [])
+})
+
+t('boundSessions: an unresolved target (no host binding row) claims nothing', () => {
+  const sessions = [S('s1', '/repo/.dsh-wt/feat-a')]
+  assert.deepEqual(boundSessions('/repo/.dsh-wt/feat-a', sessions, []), [])
+})
+
+t('boundSessions: a different worktree with a different tail is never matched', () => {
+  const sessions = [S('s1', '/repo/.dsh-wt/other')]
+  const bindings = [
+    B('/repo/.dsh-wt/feat-a', '/repo/.dsh-wt/feat-a'),
+    B('/repo/.dsh-wt/other', '/repo/.dsh-wt/other'),
+  ]
+  assert.deepEqual(boundSessions('/repo/.dsh-wt/feat-a', sessions, bindings), [])
 })
 
 // ── api() ───────────────────────────────────────────────────────────────────

@@ -2,7 +2,7 @@
  * Regression tests for the "current DSH" compatibility fix:
  *
  *  1. missing-slot runtime — the client requests only the slots that exist in
- *     0.1.5-rc.2 (`sidebar.footer.action`) and never the removed
+ *     0.1.7-rc.2 (`sidebar.footer.action`) and never the removed
  *     `sidebar.workspaces.create` chain;
  *  2. service wiring — the bound-session flow goes through the ui-workspace
  *     service (`uiWorkspace.connectWorkspace`/`openSession`/`archiveSession`),
@@ -70,7 +70,7 @@ const t = (name, fn) => tests.push([name, fn])
 
 // ── 1. missing-slot runtime ─────────────────────────────────────────────────
 
-t('apply: only requests existing 0.1.5-rc.2 slots (no removed create chain)', () => {
+t('apply: only requests existing 0.1.7-rc.2 slots (no removed create chain)', () => {
   const injections = []
   const registrations = []
   const ctx = {

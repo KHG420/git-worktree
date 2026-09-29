@@ -8,10 +8,10 @@
  * Run: node test/tools-edge.js
  */
 import assert from 'node:assert/strict'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { canonicalize } from '../lib/git.js'
-import { bootPlugin, commitFile, execAt, git, gitFail, makeBareRemote, makeRepo, makeUnbornRepo, scratchRoot } from './helpers.js'
+import { bootPlugin, commitFile, execAt, git, gitFail, makeAgents, makeBareRemote, makeRepo, makeUnbornRepo, scratchRoot } from './helpers.js'
 
 let passed = 0
 const tests = []
@@ -554,6 +554,268 @@ t('add: name and path together — path wins (documented precedence)', async () 
   assert.ok(list.worktrees.some((w) => w.absolutePath === canonicalize(explicit)), 'worktree created at the explicit path')
   assert.ok(!list.worktrees.some((w) => w.path.includes('ignored')), 'no worktree created for the ignored name')
   await tools.git_worktree_remove.execute({ path: explicit }, exec)
+})
+
+// ── AC4: fresh-name branch semantics ────────────────────────────────────────
+
+t('add: name-based auto mode never reuses an existing branch; unique suffixes a NEW branch', async () => {
+  const br = makeRepo(root, 'branch-sem')
+  git(br, 'branch', 'feature') // feature at the initial commit (A)
+  const A = git(br, 'rev-parse', 'feature').toString().trim()
+  commitFile(br, 'b.txt', 'b\n', 'second') // main advances to B
+  const B = git(br, 'rev-parse', 'HEAD').toString().trim()
+  assert.notEqual(A, B)
+
+  const r = await tools.git_worktree_add.execute({ repo: br, name: 'feature', unique: true }, execAt(br))
+  assert.equal(r.branch, 'feature-2', 'collision created a NEW suffixed branch')
+  const wtDir = join(br, '.dsh-wt', 'feature-2')
+  assert.equal(git(wtDir, 'rev-parse', 'HEAD').toString().trim(), B, 'new branch starts at main HEAD, not the reused branch')
+  assert.equal(git(br, 'rev-parse', 'feature').toString().trim(), A, 'the existing branch is untouched')
+  await tools.git_worktree_remove.execute({ repo: br, path: wtDir }, execAt(br))
+
+  // unique:false → strict failure instead of silently checking out the branch
+  await rejects(
+    tools.git_worktree_add.execute({ repo: br, name: 'feature' }, execAt(br)),
+    /already exists|already used/,
+    'non-unique name-based add fails rather than reuse an unchecked-out branch',
+  )
+  // --force must not bypass fresh-branch creation in auto-name mode
+  await rejects(
+    tools.git_worktree_add.execute({ repo: br, name: 'feature', force: true }, execAt(br)),
+    /already exists|already used/,
+    'force does not produce a shared-branch worktree',
+  )
+})
+
+t('add: fresh / explicit-branch / newBranch-conflict / detach / commitIsh keep their semantics', async () => {
+  const br = makeRepo(root, 'branch-modes')
+  git(br, 'branch', 'existing')
+  const E = git(br, 'rev-parse', 'existing').toString().trim()
+
+  const fresh = await tools.git_worktree_add.execute({ repo: br, name: 'fresh' }, execAt(br))
+  assert.equal(fresh.branch, 'fresh', 'normal fresh branch creation')
+
+  await rejects(
+    tools.git_worktree_add.execute({ repo: br, name: 'nb', newBranch: 'existing' }, execAt(br)),
+    /already exists/,
+    'explicit newBranch conflict stays git\'s strict failure',
+  )
+
+  const reuse = await tools.git_worktree_add.execute({ repo: br, name: 'reuse', branch: 'existing' }, execAt(br))
+  assert.equal(reuse.branch, 'existing', 'explicit branch reuse preserved')
+  assert.equal(git(join(br, '.dsh-wt', 'reuse'), 'rev-parse', 'HEAD').toString().trim(), E)
+
+  const det = await tools.git_worktree_add.execute({ repo: br, name: 'det', detach: true }, execAt(br))
+  assert.equal(det.detached, true)
+  assert.equal(det.branch, null)
+
+  const ci = await tools.git_worktree_add.execute({ repo: br, name: 'ci', commitIsh: E }, execAt(br))
+  assert.equal(ci.detached, true, 'commitIsh without newBranch is a detached worktree')
+  assert.equal(git(join(br, '.dsh-wt', 'ci'), 'rev-parse', 'HEAD').toString().trim(), E)
+
+  for (const name of ['fresh', 'reuse', 'det', 'ci']) {
+    await tools.git_worktree_remove.execute({ repo: br, path: join(br, '.dsh-wt', name) }, execAt(br))
+  }
+})
+
+t('add: concurrent identical name+unique requests never share a branch', async () => {
+  const br = makeRepo(root, 'branch-race')
+  const [a, b] = await Promise.all([
+    tools.git_worktree_add.execute({ repo: br, name: 'race', unique: true }, execAt(br)),
+    tools.git_worktree_add.execute({ repo: br, name: 'race', unique: true }, execAt(br)),
+  ])
+  assert.deepEqual([a.path, b.path].sort(), ['.dsh-wt/race', '.dsh-wt/race-2'], 'base name and deduped sibling')
+  assert.notEqual(a.branch, b.branch, 'distinct branches (no shared-branch race)')
+  assert.equal(
+    git(br, 'rev-parse', a.branch).toString().trim(),
+    git(br, 'rev-parse', b.branch).toString().trim(),
+    'both fresh branches point at the same main HEAD',
+  )
+  await tools.git_worktree_remove.execute({ repo: br, path: join(br, '.dsh-wt', 'race') }, execAt(br))
+  await tools.git_worktree_remove.execute({ repo: br, path: join(br, '.dsh-wt', 'race-2') }, execAt(br))
+})
+
+// ── AC5: local info/exclude for the name-based parent ───────────────────────
+
+const excludeOf = (dir) => join(
+  git(dir, 'rev-parse', '--path-format=absolute', '--git-common-dir').toString().trim(),
+  'info',
+  'exclude',
+)
+const readExclude = (dir) => {
+  try { return readFileSync(excludeOf(dir), 'utf8') } catch { return null }
+}
+const countRule = (content, rule) => content.split(/\r?\n/).filter((line) => line === rule).length
+
+t('exclude: a name-based worktree keeps main clean and git add -A stages no gitlink', async () => {
+  const ex = makeRepo(root, 'exclude-clean')
+  await tools.git_worktree_add.execute({ repo: ex, name: 'wt' }, execAt(ex))
+  assert.equal(git(ex, 'status', '--short').toString().trim(), '', 'clean main after a nested name-based worktree')
+  const content = readExclude(ex)
+  assert.equal(countRule(content, '/.dsh-wt/'), 1, 'the anchored local rule is present exactly once')
+
+  writeFileSync(join(ex, 'unrelated.txt'), 'x\n')
+  git(ex, 'add', '-A')
+  const staged = git(ex, 'diff', '--cached', '--name-only').toString()
+  assert.ok(staged.includes('unrelated.txt'), 'unrelated dirty files still staged')
+  assert.ok(!staged.includes('.dsh-wt'), 'the nested worktree is NOT staged as a gitlink')
+  await tools.git_worktree_remove.execute({ repo: ex, path: join(ex, '.dsh-wt', 'wt') }, execAt(ex))
+})
+
+t('exclude: idempotent, preserves existing bytes, and survives concurrent creation', async () => {
+  const ex = makeRepo(root, 'exclude-idem')
+  const file = excludeOf(ex)
+  writeFileSync(file, 'custom-rule')
+  await tools.git_worktree_add.execute({ repo: ex, name: 'one' }, execAt(ex))
+  let content = readFileSync(file, 'utf8')
+  assert.ok(content.startsWith('custom-rule\n'), 'existing bytes preserved and newline-separated')
+  assert.equal(countRule(content, '/.dsh-wt/'), 1, 'one rule after the first create')
+  await tools.git_worktree_add.execute({ repo: ex, name: 'two' }, execAt(ex))
+  content = readFileSync(file, 'utf8')
+  assert.ok(content.startsWith('custom-rule\n'), 'custom rule still first')
+  assert.equal(countRule(content, '/.dsh-wt/'), 1, 'idempotent — no duplicate on the second create')
+
+  const race = makeRepo(root, 'exclude-race')
+  await Promise.all([
+    tools.git_worktree_add.execute({ repo: race, name: 'a' }, execAt(race)),
+    tools.git_worktree_add.execute({ repo: race, name: 'b' }, execAt(race)),
+  ])
+  const raceContent = readFileSync(excludeOf(race), 'utf8')
+  assert.equal(countRule(raceContent, '/.dsh-wt/'), 1, 'concurrent creates leave exactly one rule')
+})
+
+t('exclude: an empty/non-newline exclude file is handled; a linked worktree writes the shared file', async () => {
+  const ex = makeRepo(root, 'exclude-bytes')
+  const file = excludeOf(ex)
+  writeFileSync(file, '')
+  await tools.git_worktree_add.execute({ repo: ex, name: 'wt' }, execAt(ex))
+  assert.equal(readFileSync(file, 'utf8'), '/.dsh-wt/\n', 'empty file gains exactly the rule')
+
+  // creating from INSIDE the linked worktree still targets the main root and
+  // the shared common-dir exclude
+  const wt = join(ex, '.dsh-wt', 'wt')
+  await tools.git_worktree_add.execute({ repo: ex, name: 'from-linked' }, execAt(wt))
+  assert.equal(countRule(readFileSync(file, 'utf8'), '/.dsh-wt/'), 1, 'shared exclude, still one rule')
+  assert.equal(git(ex, 'status', '--short').toString().trim(), '', 'main stays clean')
+})
+
+t('exclude: configured parent with spaces and metacharacters', async () => {
+  for (const [label, dirName, rule] of [['spaces', 'my wt', '/my wt/'], ['metachar', 'we[i]rd', '/we\\[i\\]rd/']]) {
+    const ex = makeRepo(root, `exclude-${label}`)
+    const plugin = await bootPlugin({ caps: { worktreesDir: dirName } })
+    await plugin.tools.git_worktree_add.execute({ repo: ex, name: 'wt' }, execAt(ex))
+    const content = readExclude(ex)
+    assert.equal(countRule(content, rule), 1, `${label}: escaped anchored rule written`)
+    assert.equal(git(ex, 'status', '--short').toString().trim(), '', `${label}: main stays clean`)
+    git(ex, 'add', '-A')
+    assert.ok(!git(ex, 'diff', '--cached', '--name-only').toString().includes(dirName), `${label}: worktree not staged`)
+  }
+})
+
+t('exclude: a contained parent whose name starts with ".." is still ignored', async () => {
+  // The traversal check must be segment-aware: "..worktrees" is a valid
+  // INSIDE-root directory name, not a parent escape.
+  const ex = makeRepo(root, 'exclude-dotdot')
+  const plugin = await bootPlugin({ caps: { worktreesDir: '..worktrees' } })
+  const made = await plugin.tools.git_worktree_add.execute({ repo: ex, name: 'wt' }, execAt(ex))
+  assert.ok(made.absolutePath.includes('..worktrees'), 'worktree created under the contained ..-prefixed parent')
+  assert.equal(countRule(readExclude(ex), '/..worktrees/'), 1, 'anchored rule written for the contained parent')
+  assert.equal(git(ex, 'status', '--short').toString().trim(), '', 'main stays clean')
+})
+
+t('exclude: explicit paths and outside-repo parents get no unrelated ignore edits', async () => {
+  const ex = makeRepo(root, 'exclude-explicit')
+  const before = readExclude(ex)
+  const outside = join(root, 'exclude-explicit-wt')
+  await tools.git_worktree_add.execute({ repo: ex, path: outside, newBranch: 'exp-b' }, execAt(ex))
+  assert.equal(readExclude(ex), before, 'explicit path does not edit info/exclude')
+  await tools.git_worktree_remove.execute({ repo: ex, path: outside }, execAt(ex))
+
+  const outsideParent = join(root, 'exclude-outside-parent')
+  const plugin = await bootPlugin({ caps: { worktreesDir: outsideParent } })
+  const before2 = readExclude(ex)
+  const made = await plugin.tools.git_worktree_add.execute({ repo: ex, name: 'out' }, execAt(ex))
+  assert.ok(made.absolutePath.startsWith(outsideParent), 'worktree lives under the outside parent')
+  assert.equal(readExclude(ex), before2, 'an outside-repo parent gets no ignore edit')
+  await plugin.tools.git_worktree_remove.execute({ repo: ex, path: made.absolutePath }, execAt(ex))
+})
+
+t('exclude: a write failure is reported, never a silent unprotected success', async () => {
+  const ex = makeRepo(root, 'exclude-fail')
+  const file = excludeOf(ex)
+  // git can still READ the exclude file, so the worktree creation succeeds;
+  // the plugin's APPEND then fails with EACCES and must surface the
+  // unprotected worktree instead of returning a silent success.
+  chmodSync(file, 0o444)
+  await rejects(
+    tools.git_worktree_add.execute({ repo: ex, name: 'wt' }, execAt(ex)),
+    /local git exclusion could not be installed/,
+    'the unprotected worktree is reported instead of a silent success',
+  )
+  chmodSync(file, 0o644)
+})
+
+// ── AC3: same-host occupancy guard (native agents registry) ─────────────────
+
+t('occupancy: a missing agents service keeps the binding usable (honest limitation)', async () => {
+  const r = await tools.git_session_binding.execute({}, execAt(repo))
+  assert.equal(r.notARepo, false, 'no agents service → binding still resolves')
+})
+
+t('occupancy: caller ignored; running peer/child reported; idle peer not; longest-match separation', async () => {
+  const occ = makeRepo(root, 'occ')
+  const live = []
+  const plugin = await bootPlugin({ agents: makeAgents(live) })
+  const occTools = plugin.tools
+  const wt = join(occ, '.dsh-wt', 'occ-wt')
+  await occTools.git_worktree_add.execute({ repo: occ, name: 'occ-wt' }, execAt(occ))
+  const deep = join(wt, 'deep')
+  mkdirSync(deep, { recursive: true })
+
+  live.length = 0
+  live.push({ id: 'me', status: 'running', cwd: wt })
+  let r = await occTools.git_session_binding.execute({}, execAt(wt, 'me'))
+  assert.equal(r.bound, true, 'the caller itself is ignored')
+
+  live.push({ id: 'other', status: 'running', cwd: wt })
+  await rejects(occTools.git_session_binding.execute({}, execAt(wt, 'me')), /occupied by running agent/, 'running peer reported')
+  await rejects(occTools.git_repo_status.execute({}, execAt(wt, 'me')), /occupied by running agent/, 'repo_status binding carries the same occupancy error')
+
+  live[1].status = 'idle'
+  r = await occTools.git_session_binding.execute({}, execAt(wt, 'me'))
+  assert.equal(r.bound, true, 'an idle peer is not misrepresented as actively writing')
+
+  live[1].status = 'running'
+  live[1].cwd = deep
+  await rejects(occTools.git_session_binding.execute({}, execAt(wt, 'me')), /occupied by running agent/, 'nested child cwd resolves to the same worktree')
+
+  const docs = join(occ, 'docs')
+  mkdirSync(docs, { recursive: true })
+  live[1].cwd = docs
+  r = await occTools.git_session_binding.execute({}, execAt(wt, 'me'))
+  assert.equal(r.bound, true, 'a main-repo subdir writer does not occupy the linked worktree')
+  await rejects(occTools.git_session_binding.execute({}, execAt(occ, 'me')), /occupied by running agent/, 'the primary worktree is occupied separately')
+
+  live.length = 0
+  await occTools.git_worktree_remove.execute({ repo: occ, path: wt }, execAt(occ, 'me'))
+})
+
+t('occupancy: worktreeRemove refuses a running occupant — caller included — even with force', async () => {
+  const occ = makeRepo(root, 'occ-remove')
+  const live = []
+  const plugin = await bootPlugin({ agents: makeAgents(live) })
+  const occTools = plugin.tools
+  const wt = join(occ, '.dsh-wt', 'victim')
+  await occTools.git_worktree_add.execute({ repo: occ, name: 'victim' }, execAt(occ))
+  live.push({ id: 'me', status: 'running', cwd: wt })
+  await rejects(
+    occTools.git_worktree_remove.execute({ repo: occ, path: wt, force: true }, execAt(occ, 'me')),
+    /refusing to remove worktree .*running agent/,
+    'the caller occupant is refused even with force',
+  )
+  live.length = 0
+  const removed = await occTools.git_worktree_remove.execute({ repo: occ, path: wt }, execAt(occ))
+  assert.equal(removed.removed, '.dsh-wt/victim')
 })
 
 // ── sequential runner (these tests share one repo — order matters) ─────────

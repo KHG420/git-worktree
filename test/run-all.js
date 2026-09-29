@@ -14,6 +14,7 @@ const suites = [
   'unit-git.js',      // git runner + helpers (lib/git.js)
   'test.js',          // original functional suite (tools + route handlers)
   'tools-edge.js',    // 9 tools × boundary matrix against real repos
+  'tasks.js',         // 4 task tools: orchestration, records, integration
   'routes-http.js',   // real-HTTP route surface (methods, bodies, caps, timeout)
   'client-unit.js',   // client pure helpers (sanitizeName, sessionsSame, api)
   'client-smoke.js',  // client bundle load + current-service wiring

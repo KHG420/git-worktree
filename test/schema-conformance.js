@@ -22,16 +22,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-// Prefer the validator shipped by the *running* DSH install (0.1.5-rc.2): the
-// acceptance criterion is that the outputs pass the REAL dsh-tools validator,
-// and the plugin's own dependency can lag behind. Fall back to the resolvable
-// package, then to the local dependency.
-const runtimeValidatorCandidates = [
-  process.env.DSH_TOOLS,
-  '/Users/aq/.npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js',
-]
+// Use an explicitly selected host validator when supplied; otherwise validate
+// against the DSH version pinned by this plugin. A stale global DSH install
+// must not silently make a new-version conformance run pass.
+const runtimeValidatorCandidates = [process.env.DSH_TOOLS]
 let validateJsonSchemaValue
-let validatorSource = '@deepseek-ai/dsh-tools (local dependency)'
+let validatorSource = '@deepseek-ai/dsh-tools (pinned plugin dependency)'
 for (const candidate of runtimeValidatorCandidates) {
   if (!candidate || !existsSync(candidate)) continue
   try {
@@ -94,7 +90,13 @@ const plugin = (await import('../index.js')).default
 await plugin.apply(ctx, { worktreesDir: '.dsh-wt', timeoutMs: 30000, stdoutMaxBytes: 1_000_000, stderrMaxBytes: 64 * 1024 })
 
 const tools = Object.fromEntries(registered.map((t) => [t.name, t]))
-assert.equal(Object.keys(tools).length, 9, 'expect 9 tools registered')
+assert.equal(Object.keys(tools).length, 13, 'expect 13 tools registered (9 git + 4 task)')
+assert.deepEqual(Object.keys(tools).sort(), [
+  'git_branch_create', 'git_branch_delete', 'git_branch_list', 'git_branch_switch',
+  'git_repo_status', 'git_session_binding',
+  'git_task_cancel', 'git_task_integrate', 'git_task_start', 'git_task_status',
+  'git_worktree_add', 'git_worktree_list', 'git_worktree_remove',
+])
 
 // ── scratch repo ──────────────────────────────────────────────────────────
 const base = mkdtempSync(join(tmpdir(), 'dsh-gw-schema-'))
@@ -258,6 +260,103 @@ try {
   const removedDetached = await tools.git_worktree_remove.execute({ path: detachedPath }, exec)
   check('git_worktree_remove (detached)', tools.git_worktree_remove.output.schema, removedDetached)
 
+  // ── task tools (13-tool strict schemas, incl. nullable/error outcomes) ────
+  const taskDir = join(base, '.git', 'dsh-git-worktree', 'tasks')
+  mkdirSync(taskDir, { recursive: true })
+  const completedId = 'task-0123456789abcdef'
+  const completedRecord = {
+    version: 1,
+    taskId: completedId,
+    name: 'conf-task',
+    repoRoot: base,
+    worktreePath: join(base, '.dsh-wt', 'conf-task'),
+    branch: 'conf-task',
+    base: null,
+    status: 'completed',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    owner: { pid: process.pid, startedAt: 0 },
+    parentSessionId: 'parent',
+    sessionId: 'child',
+    summary: 'done',
+    commit: 'abc123',
+    error: null,
+    setup: { ok: false, commands: [['x']], failedCommand: ['x'], exitCode: null, output: 'o' },
+    integration: null,
+  }
+  writeFileSync(join(taskDir, `${completedId}.json`), JSON.stringify(completedRecord, null, 2))
+
+  const taskStatus = await tools.git_task_status.execute({ taskId: completedId }, exec)
+  check('git_task_status (one)', tools.git_task_status.output.schema, taskStatus)
+  assert.equal(taskStatus.tasks[0].taskId, completedId)
+  const taskList = await tools.git_task_status.execute({}, exec)
+  check('git_task_status (list)', tools.git_task_status.output.schema, taskList)
+  const cancelled = await tools.git_task_cancel.execute({ taskId: completedId }, exec)
+  check('git_task_cancel (finished)', tools.git_task_cancel.output.schema, cancelled)
+
+  // An unavailable agents service is a clear error, not a schema violation.
+  await assert.rejects(
+    tools.git_task_start.execute({ name: 'x', prompt: 'p' }, exec),
+    /agents service/i,
+    'task start without the agents service must fail clearly',
+  )
+
+  // Nullable-heavy and fully-populated synthetic summaries both validate.
+  const nullSummary = {
+    taskId: completedId, name: 'x', status: 'preparing', branch: null, worktreePath: '/r/wt',
+    repo: '/r', base: null, sessionId: null, summary: null, commit: null, error: null,
+    createdAt: null, updatedAt: null, setup: null, integration: null,
+  }
+  check('git_task_start summary (nullable)', tools.git_task_start.output.schema, nullSummary)
+  check('git_task_status item (nullable)', tools.git_task_status.output.schema, { tasks: [nullSummary] })
+  const fullSummary = {
+    ...nullSummary, status: 'completed', branch: 'b', sessionId: 's', summary: 'done', commit: 'abc',
+    createdAt: 't', updatedAt: 't',
+    setup: { ok: false, failedCommand: ['a'], exitCode: null, output: 'o' },
+    integration: {
+      status: 'verified', verified: true, targetWorktreePath: '/r', targetBranch: 'main',
+      mergedCommit: 'abc', targetHeadAtMerge: 'def', conflicts: [],
+      verification: {
+        commands: [['a']], verified: true, at: 't',
+        results: [{ command: ['a'], exitCode: 0, timedOut: false, ok: true, output: '' }],
+      },
+    },
+  }
+  check('git_task_status item (full)', tools.git_task_status.output.schema, { tasks: [fullSummary] })
+  check('git_task_status item (null verification)', tools.git_task_status.output.schema, {
+    tasks: [{ ...fullSummary, integration: { ...fullSummary.integration, verification: null } }],
+  })
+
+  // Strictness has teeth: an unknown summary key must still be rejected.
+  const unknownViolations = validateJsonSchemaValue(tools.git_task_start.output.schema, { ...nullSummary, bogus: 1 }, 'value')
+  assert.ok(unknownViolations.some((v) => v.includes('bogus')), `start schema must reject unknown keys: ${unknownViolations.join('; ')}`)
+  assertions += 1
+
+  // integrate output: verified, unverified (no commands), and conflicted shapes.
+  const integrateSchema = tools.git_task_integrate.output.schema
+  const verifiedOut = {
+    taskId: completedId, status: 'verified', merged: true, verified: true, conflicts: [],
+    verification: {
+      commands: [['a']], verified: true, at: 't',
+      results: [{ command: ['a'], exitCode: 0, timedOut: false, ok: true, output: '' }],
+    },
+    target: { repo: '/r', worktreePath: '/r', branch: 'main', headBefore: 'a', headAfter: 'b' },
+    message: 'm',
+  }
+  check('git_task_integrate (verified)', integrateSchema, verifiedOut)
+  check('git_task_integrate (unverified)', integrateSchema, { ...verifiedOut, status: 'unverified', verified: false, verification: null })
+  check('git_task_integrate (conflicted)', integrateSchema, {
+    taskId: completedId, status: 'conflicted', merged: false, verified: false, conflicts: ['f'],
+    verification: null,
+    target: { repo: '/r', worktreePath: '/r', branch: 'main', headBefore: 'a', headAfter: null },
+    message: 'm',
+  })
+  await assert.rejects(
+    tools.git_task_integrate.execute({ taskId: 'task-0000000000000000' }, exec),
+    /no task record/i,
+    'integrating an unknown task is a clear refusal',
+  )
+
   // ── teeth check: the validator must actually flag an undeclared property,
   // or this suite proves nothing. Replay the pre-fix drift: git_worktree_list
   // schema without absolutePath must reject the operation's output. ─────────
@@ -272,7 +371,7 @@ try {
   )
   assertions += 1
 
-  console.log(`✅ schema conformance: ${assertions} assertions passed (all 9 tools conform to their declared output schemas)`)
+  console.log(`✅ schema conformance: ${assertions} assertions passed (all 13 tools conform to their declared output schemas)`)
 } finally {
   rmSync(base, { recursive: true, force: true })
 }

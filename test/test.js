@@ -62,7 +62,7 @@ const plugin = (await import('../index.js')).default
 await plugin.apply(ctx, { worktreesDir: '.dsh-wt', timeoutMs: 30000, stdoutMaxBytes: 1_000_000, stderrMaxBytes: 64 * 1024 })
 
 const tools = Object.fromEntries(registered.map((t) => [t.name, t]))
-assert.equal(Object.keys(tools).length, 9, 'expect 9 tools registered')
+assert.equal(Object.keys(tools).length, 13, 'expect 13 tools registered (9 git + 4 task)')
 assert.equal(routeRegistrations.length, 1, 'expect 1 webServer route registration')
 assert.equal(routeRegistrations[0].path, '/dsh-git-worktree', 'route prefix')
 
@@ -369,7 +369,7 @@ try {
   assert.ok(resp.payload.error.message.includes('not a git repository'), 'mutation surfaces the missing-directory failure')
   assert.ok(resp.payload.error.message.includes('no such directory'), 'mutation names the missing directory')
 
-  console.log('✅ all 9 tools + route handlers passed against a scratch repo')
+  console.log('✅ all 13 tools + route handlers passed against a scratch repo')
   console.log(`   scratch repo: ${base} (left in place for inspection)`)
 } finally {
   rmSync(nonRepoDir, { recursive: true, force: true })

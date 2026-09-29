@@ -15,7 +15,7 @@
  */
 
 import { execFileSync, spawn } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -90,15 +90,25 @@ export function makeSubprocess({ killAfterMs = null, slowCommands = null } = {})
 /**
  * Boot the real plugin against a fake ctx. Returns the tool registry (by
  * name), the webServer route registrations, and the fake ctx.
+ *
+ * `agents` is the optional native agent registry (`ctx.get('agents')`):
+ * pass a real registry-shaped fake to exercise the same-host occupancy guard,
+ * or omit it for the minimal profile (no agents service).
  */
-export async function bootPlugin({ caps = {}, subprocess } = {}) {
+export async function bootPlugin({ caps = {}, subprocess, agents, services } = {}) {
   const registered = []
   const routeRegistrations = []
+  const effects = []
   const ctx = {
     subprocess: subprocess ?? makeSubprocess(),
     tools: { register: (tool) => registered.push(tool) },
     systemPrompt: { section: () => {} },
-    effect: (fn) => fn(),
+    effect: (fn) => {
+      const disposer = fn()
+      if (typeof disposer === 'function') effects.push(disposer)
+      return disposer
+    },
+    get: (name) => (name === 'agents' ? agents : services?.[name]),
     inject: (names, callback) => {
       const scoped = { ...ctx, webServer: { register: (route) => routeRegistrations.push(route) } }
       callback(scoped)
@@ -111,18 +121,35 @@ export async function bootPlugin({ caps = {}, subprocess } = {}) {
     timeoutMs: 30000,
     stdoutMaxBytes: 1_000_000,
     stderrMaxBytes: 64 * 1024,
+    setupCommands: [],
     ...caps,
   })
   return {
     ctx,
     tools: Object.fromEntries(registered.map((t) => [t.name, t])),
     routes: routeRegistrations,
+    effects,
   }
 }
 
-/** A tool execution context rooted at `cwd` (the agent session header form). */
-export function execAt(cwd) {
-  return { agent: { session: { header: { cwd } } }, signal: new AbortController().signal }
+/**
+ * A tool execution context rooted at `cwd` (the agent session header form).
+ * `agentId` mirrors the live Agent's shared agent/session id, used to ignore
+ * the caller in the occupancy guard.
+ */
+export function execAt(cwd, agentId) {
+  return { agent: { id: agentId, session: { header: { cwd } } }, signal: new AbortController().signal }
+}
+
+/** A real registry-shaped `ctx.get('agents')` fake: `list()` returns live agents. */
+export function makeAgents(entries) {
+  return {
+    list: () => entries.map((entry) => ({
+      id: entry.id,
+      status: entry.status,
+      session: { header: { cwd: entry.cwd } },
+    })),
+  }
 }
 
 /** A route-style execution context (no agent; cwd = server process cwd). */
@@ -148,7 +175,17 @@ export function gitFail(dir, ...args) {
 
 /** Create and initialize a scratch root; returned root is removed on process exit. */
 export function scratchRoot(label = 'dsh-gw') {
-  const root = mkdtempSync(join(tmpdir(), `${label}-`))
+  const created = mkdtempSync(join(tmpdir(), `${label}-`))
+  // Canonicalize the root: on macOS os.tmpdir() is the `/var` symlink while
+  // git (and the plugin) report realpath-resolved `/private/var` paths. Tests
+  // compare these paths directly, so a canonical scratch root keeps the
+  // requested repo and the reported worktree in the same form.
+  let root = created
+  try {
+    root = realpathSync(created)
+  } catch {
+    /* keep the raw mkdtemp path when it cannot be resolved */
+  }
   if (process.env.KEEP_SCRATCH !== '1') process.on('exit', () => rmSync(root, { recursive: true, force: true }))
   return root
 }
